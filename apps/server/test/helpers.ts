@@ -11,10 +11,10 @@ export const TEST_CONFIG: CompanyConfig = parseCompanyConfig({
   ],
   autoApproveTier2: ['staging.deploy'],
   agents: [
-    { id: 'ava', name: 'Ava', kind: 'orchestrator', role: 'chief-of-staff', model: 'claude-opus-5-5', tools: [] },
-    { id: 'kai', name: 'Kai', kind: 'worker', role: 'backend-engineer', model: 'claude-sonnet-5-5', tools: ['repo.read', 'github.create_branch', 'staging.deploy'] },
-    { id: 'omar', name: 'Omar', kind: 'worker', role: 'account-executive', model: 'claude-sonnet-5-5', tools: ['repo.read', 'email.send'] },
-    { id: 'rex', name: 'Rex', kind: 'reviewer', role: 'reviewer', model: 'claude-opus-5-5', tools: [] },
+    { id: 'ava', name: 'Ava', kind: 'orchestrator', role: 'chief-of-staff', model: 'ollama:qwen3:8b', tools: [] },
+    { id: 'kai', name: 'Kai', kind: 'worker', role: 'backend-engineer', model: 'ollama:qwen3:8b', tools: ['repo.read', 'github.create_branch', 'staging.deploy'] },
+    { id: 'omar', name: 'Omar', kind: 'worker', role: 'account-executive', model: 'ollama:qwen3:8b', tools: ['repo.read', 'email.send'] },
+    { id: 'rex', name: 'Rex', kind: 'reviewer', role: 'reviewer', model: 'ollama:qwen3:8b', tools: [] },
   ],
 });
 

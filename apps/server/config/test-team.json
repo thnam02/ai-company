@@ -1,0 +1,15 @@
+{
+  "tools": [
+    { "name": "files.read", "tier": 0, "description": "Read a file in the workspace, or list a folder" },
+    { "name": "files.write", "tier": 1, "description": "Create or replace a file in the workspace" },
+    { "name": "email.send", "tier": 3, "description": "Send an email (in this version: written to workspace/outbox/, not sent)" }
+  ],
+  "autoApproveTier2": [],
+  "limits": {},
+  "agents": [
+    { "id": "ava", "name": "Ava", "kind": "orchestrator", "role": "chief-of-staff", "model": "ollama:qwen3:8b", "options": { "think": true, "temperature": 0.2 }, "tools": [] },
+    { "id": "kai", "name": "Kai", "kind": "worker", "role": "researcher", "model": "ollama:qwen3:8b", "options": { "think": false, "temperature": 0.2, "numCtx": 16384 }, "tools": ["files.read", "files.write"] },
+    { "id": "zara", "name": "Zara", "kind": "worker", "role": "writer", "model": "ollama:qwen3:8b", "options": { "think": false, "temperature": 0.3, "numCtx": 16384 }, "tools": ["files.read", "files.write", "email.send"] },
+    { "id": "rex", "name": "Rex", "kind": "reviewer", "role": "reviewer", "model": "ollama:qwen3:8b", "options": { "think": true, "temperature": 0.1 }, "tools": [] }
+  ]
+}

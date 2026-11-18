@@ -40,6 +40,10 @@ export class PolicyEngine {
     return this.tools.has(name);
   }
 
+  listTools(): ToolSpec[] {
+    return [...this.tools.values()].map((t) => ({ ...t }));
+  }
+
   check(agent: AgentProfile, toolName: string): PolicyDecision {
     const tool = this.tools.get(toolName);
     if (!tool) return { kind: 'deny', reason: `unknown tool "${toolName}"` };

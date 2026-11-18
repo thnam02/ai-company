@@ -319,11 +319,11 @@ describe('gateway hook', () => {
     assert.ok(logs.some((l) => /gateway hook failed for mail-1: gateway down/.test(l)));
   });
 
-  test('without a hook the approved action is only logged, never returned', async () => {
+  test('without executors the released action is only logged, never returned', async () => {
     const { call, engine, logs } = await start(undefined, { onExecute: undefined });
     const taskId = taskAwaitingApproval(engine);
     const res = await call('POST', `/tasks/${taskId}/approval`, { approved: true });
     assert.deepEqual(res.body, { state: 'done' });
-    assert.ok(logs.some((l) => /email.send \(mail-1\).*no gateway/.test(l)));
+    assert.ok(logs.some((l) => /email.send \(mail-1\).*no executors are configured/.test(l)));
   });
 });

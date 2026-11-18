@@ -8,6 +8,7 @@
     "start": "node src/main.ts"
   },
   "dependencies": {
+    "@ai-company/agents": "0.1.0",
     "@ai-company/core": "0.1.0",
     "better-sqlite3": "^13.2.0",
     "pg": "^8.23.1",

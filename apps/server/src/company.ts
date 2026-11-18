@@ -11,6 +11,7 @@ import {
   type ToolSpec,
   type WorkflowEngine,
 } from '@ai-company/core';
+import { parseModelRef, type ModelOptions } from '@ai-company/agents';
 
 /**
  * Company configuration: tools with risk tiers, the tier-2 auto-approve list,
@@ -21,7 +22,29 @@ export interface CompanyConfig {
   tools: ToolSpec[];
   autoApproveTier2: string[];
   limits: Partial<Limits>;
+  /** `model` is a "<provider>:<model>" ref, e.g. "ollama:qwen3:8b". */
   agents: Omit<AgentProfile, 'paused' | 'benched'>[];
+  /** Per-agent model options. Runtime config only: never registered with the engine or logged as events. */
+  modelOptions: Record<string, ModelOptions>;
+}
+
+const OPTION_CHECKS: Record<keyof ModelOptions, (v: unknown) => boolean> = {
+  temperature: (v) => typeof v === 'number' && v >= 0 && v <= 2,
+  numCtx: (v) => Number.isInteger(v) && (v as number) >= 512 && (v as number) <= 1_048_576,
+  think: (v) => typeof v === 'boolean',
+};
+
+function parseModelOptions(agentId: string, raw: unknown): ModelOptions {
+  if (raw === undefined) return {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error(`agent "${agentId}" options must be an object`);
+  const options: ModelOptions = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const check = OPTION_CHECKS[key as keyof ModelOptions];
+    if (!check) throw new Error(`agent "${agentId}" has unknown option "${key}" (temperature, numCtx, think)`);
+    if (!check(value)) throw new Error(`agent "${agentId}" option ${key} is invalid`);
+    (options as Record<string, unknown>)[key] = value;
+  }
+  return options;
 }
 
 const KINDS: readonly AgentKind[] = ['orchestrator', 'worker', 'reviewer'];
@@ -70,10 +93,13 @@ export function parseCompanyConfig(raw: unknown): CompanyConfig {
   }
 
   const ids = new Set<string>();
+  const modelOptions: Record<string, ModelOptions> = {};
   const agents = c.agents.map((a: any, i: number) => {
     for (const field of ['id', 'name', 'role', 'model'] as const) {
       if (typeof a?.[field] !== 'string' || !a[field]) throw new Error(`agents[${i}] needs a "${field}"`);
     }
+    if (!parseModelRef(a.model)) throw new Error(`agent "${a.id}" model must be "<provider>:<model>", e.g. "ollama:qwen3:8b"`);
+    modelOptions[a.id] = parseModelOptions(a.id, a.options);
     if (!KINDS.includes(a.kind)) throw new Error(`agent "${a.id}" has unknown kind "${a.kind}"`);
     if (!Array.isArray(a.tools) || !a.tools.every((t: unknown) => typeof t === 'string')) throw new Error(`agent "${a.id}" needs a "tools" array`);
     if (a.kind !== 'worker' && a.tools.length) throw new Error(`agent "${a.id}" is a ${a.kind}; only workers get tools`);
@@ -88,7 +114,7 @@ export function parseCompanyConfig(raw: unknown): CompanyConfig {
     if (unknown.length) throw new Error(`agent "${a.id}" lists unknown tools: ${unknown.join(', ')}`);
   }
 
-  const config: CompanyConfig = { tools, autoApproveTier2: [...autoApproveTier2], limits, agents };
+  const config: CompanyConfig = { tools, autoApproveTier2: [...autoApproveTier2], limits, agents, modelOptions };
   buildPolicy(config); // throws on duplicate tools or a bad auto-approve entry
   return config;
 }

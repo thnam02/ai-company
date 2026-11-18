@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { ok, type Outcome, type ProposedAction, type Resolution, type Result, type WorkflowEngine } from '@ai-company/core';
+import { fail, ok, type Outcome, type PlanTask, type ProposedAction, type Resolution, type Result, type ReviewVerdict, type Submission, type TaskState, type WorkflowEngine } from '@ai-company/core';
+import type { AgentPort, AgentView, CompanyView, ToolAccess, ToolRegistry } from '@ai-company/agents';
 import type { DurableEventStore } from './durable-store.ts';
 import { attachEventStream, type EventStream } from './stream.ts';
 
@@ -11,11 +12,15 @@ export interface ServerOptions {
   /** Bearer token for the CEO. Never logged, never put in events. */
   ceoToken: string;
   /**
-   * Receives final actions released by `decideApproval`, only after the
-   * approval is durable. Delivery is at most once: nothing re-releases an
-   * action after a crash or a throwing hook. Milestone 4 replaces this with
-   * an outbox derived from the log plus a durable execution record. Never
-   * sent to the HTTP caller.
+   * Executors for released final actions (ADR 0003). A released action is
+   * executed only after its release is durable, and its result is recorded
+   * through the engine (`action.executed` / `action.failed`). Never sent to
+   * the HTTP caller.
+   */
+  tools?: ToolRegistry;
+  /**
+   * Test hook used instead of `tools`: receives released final actions after
+   * the release is durable. Nothing is recorded for them.
    */
   onExecute?: (action: ProposedAction, context: { taskId: string }) => void | Promise<void>;
   /** Called once if the event store fails. The process should exit and rebuild from the log. */
@@ -38,6 +43,13 @@ export interface CompanyServer {
    * commands' events that are not durable yet.
    */
   run<T>(fn: () => T): Promise<T>;
+  /** The only way agents reach the company: allowlisted engine commands through `run` (ADR 0003). */
+  readonly agentPort: AgentPort;
+  /**
+   * The outbox after a crash: executes (or gives up on) every released final
+   * action with no recorded result. Call once on boot, before agents start.
+   */
+  recoverActions(): Promise<void>;
   /** True once the store has failed; the server then refuses all work. */
   readonly failed: boolean;
   close(): Promise<void>;
@@ -107,23 +119,92 @@ export function createCompanyServer(options: ServerOptions): CompanyServer {
     return r.value;
   };
 
-  /** Hands an approved action to the gateway hook without making the CEO wait for it. */
+  const executing = new Set<string>();
+
+  /**
+   * Executes a released final action and records its result through the
+   * engine. Called only after the release is durable. A key already being
+   * executed in this process is skipped; across a crash, recoverActions decides.
+   */
+  const execute = async (action: ProposedAction, taskId: string, tools: ToolRegistry): Promise<void> => {
+    const key = action.idempotencyKey;
+    if (executing.has(key)) return;
+    executing.add(key);
+    try {
+      const result = await tools.executeAction(action);
+      const recorded = await run(() => engine.recordActionResult(taskId, key, result));
+      if (!recorded.ok) log(`could not record the result of ${action.tool} for task ${taskId}: ${recorded.error}`);
+      else log(`final action ${action.tool} for task ${taskId} ${result.ok ? 'done' : 'failed'}: ${result.detail}`);
+    } catch (err) {
+      // `run` failing means the server has gone fatal; the action stays pending for the next boot.
+      log(`final action ${action.tool} for task ${taskId} was not recorded: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      executing.delete(key);
+    }
+  };
+
+  /** Hands a released action to the executor without making the caller wait for it. */
   const release = (outcome: Outcome, taskId: string): void => {
     const action = outcome.execute;
     if (!action) return;
-    if (!options.onExecute) {
-      log(`final action ${action.tool} (${action.idempotencyKey}) for task ${taskId} is approved, but no gateway is configured yet (milestone 4); it was not executed`);
+    if (options.tools) {
+      void execute(action, taskId, options.tools);
       return;
     }
-    const failed = (err: unknown) =>
-      // At most once: the approval is durable, but nothing re-releases the action yet (milestone 4 outbox).
-      log(`gateway hook failed for ${action.idempotencyKey}: ${err instanceof Error ? err.message : String(err)}`);
+    if (!options.onExecute) {
+      log(`final action ${action.tool} (${action.idempotencyKey}) for task ${taskId} is released, but no executors are configured; it was not executed`);
+      return;
+    }
+    const failed = (err: unknown) => log(`gateway hook failed for ${action.idempotencyKey}: ${err instanceof Error ? err.message : String(err)}`);
     try {
       Promise.resolve(options.onExecute(action, { taskId })).catch(failed);
     } catch (err) {
       failed(err);
     }
   };
+
+  const recoverActions = async (): Promise<void> => {
+    const tools = options.tools;
+    if (!tools) return;
+    const pending = await run(() => engine.pendingActions());
+    for (const { taskId, action } of pending) {
+      const executor = tools.get(action.tool);
+      if (executor && !executor.dedupesByKey) {
+        // It may already have run: running it again could do it twice.
+        const detail = `interrupted before its result was recorded; not retried because "${action.tool}" cannot detect a repeat. Check it by hand.`;
+        const recorded = await run(() => engine.recordActionResult(taskId, action.idempotencyKey, { ok: false, detail }));
+        log(recorded.ok ? `final action ${action.tool} for task ${taskId}: ${detail}` : `could not record ${action.tool} for task ${taskId}: ${recorded.error}`);
+      } else {
+        await execute(action, taskId, tools);
+      }
+    }
+  };
+
+  // Allowlisted agent commands (ADR 0003). Each runs through the command
+  // queue, so an agent sees a result (e.g. a tool `allow`) only once it is durable.
+  const agentPort: AgentPort = Object.freeze({
+    view: () => run(() => agentView(engine)),
+    submitPlan: (goalId: string, orchestratorId: string, plan: PlanTask[]) => run(() => engine.submitPlan(goalId, orchestratorId, plan)),
+    start: (taskId: string, agentId: string) => run(() => engine.start(taskId, agentId)),
+    recordStep: (taskId: string, agentId: string, tokens: number) => run(() => engine.recordStep(taskId, agentId, tokens)),
+    recordGoalStep: (goalId: string, agentId: string, tokens: number) => run(() => engine.recordGoalStep(goalId, agentId, tokens)),
+    requestToolCall: (taskId: string, agentId: string, call: ProposedAction) => run(() => engine.requestToolCall(taskId, agentId, call)),
+    submitForReview: (taskId: string, agentId: string, submission: Submission) => run(() => engine.submitForReview(taskId, agentId, submission)),
+    recordReview: async (taskId: string, reviewerId: string, verdict: ReviewVerdict): Promise<Result<TaskState>> => {
+      const r = await run(() => engine.recordReview(taskId, reviewerId, verdict));
+      if (!r.ok) return r;
+      release(r.value, taskId);
+      return ok(r.value.state);
+    },
+    escalate: (taskId: string, agentId: string, reason: string) =>
+      run((): Result<TaskState> => {
+        const t = engine.getTask(taskId);
+        if (!t) return fail(`unknown task "${taskId}"`);
+        if (t.ownerId !== agentId) return fail('only the task owner can escalate it');
+        const name = engine.getAgent(agentId)?.name ?? agentId;
+        return engine.escalate(taskId, `${name}: ${String(reason).slice(0, 500)}`);
+      }),
+  });
 
   const routes: [string, RegExp, Handler][] = [
     ['GET', /^\/state$/, async () => ({ body: await run(() => snapshot(engine)) })],
@@ -233,6 +314,8 @@ export function createCompanyServer(options: ServerOptions): CompanyServer {
     http,
     stream,
     run,
+    agentPort,
+    recoverActions,
     get failed() {
       return failure !== null;
     },
@@ -255,6 +338,20 @@ export function snapshot(engine: WorkflowEngine) {
     goals: engine.listGoals(),
     tasks: engine.listTasks(),
   };
+}
+
+/** What agents may see: the snapshot plus, per agent, what policy lets it do with each tool. */
+function agentView(engine: WorkflowEngine): CompanyView {
+  const agents: AgentView[] = engine.listAgents().map((a) => {
+    const toolAccess: Record<string, ToolAccess> = {};
+    for (const tool of a.tools) {
+      const d = engine.policy.check(a, tool);
+      if (d.kind === 'allow') toolAccess[tool] = 'call';
+      else if (d.kind === 'needs_approval') toolAccess[tool] = 'final';
+    }
+    return { ...a, toolAccess };
+  });
+  return { ...snapshot(engine), agents, tools: engine.policy.listTools() };
 }
 
 function parseResolution(body: any): Resolution {

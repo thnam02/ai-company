@@ -3,3 +3,8 @@ export * from './providers/scripted.ts';
 export * from './providers/ollama.ts';
 export * from './tools/registry.ts';
 export * from './tools/workspace.ts';
+export * from './port.ts';
+export * from './checkpoints.ts';
+export * from './context.ts';
+export * from './roles.ts';
+export * from './runtime.ts';
