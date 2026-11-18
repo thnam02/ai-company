@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type {
+  ActionResult,
   AgentProfile,
   EngineEvent,
   FinalAction,
@@ -27,7 +28,10 @@ export const DEFAULT_LIMITS: Limits = {
   stuckAfterMs: 5 * 60_000,
   circuitBreakerEscalations: 3,
   budgetWarnAt: 0.8,
+  maxReplans: 3,
 };
+
+const MAX_ARTIFACTS = 20;
 
 export interface EngineOptions {
   policy: PolicyEngine;
@@ -48,6 +52,8 @@ export interface Submission {
   summary: string;
   /** Must cover every acceptance criterion with met: true. */
   selfCheck: SelfCheckItem[];
+  /** Workspace paths the work produced, for the reviewer. */
+  artifacts?: string[];
   /** A real-world action to perform once the work passes review (e.g. send the email). */
   finalAction?: ProposedAction;
 }
@@ -141,6 +147,19 @@ export class WorkflowEngine {
     return this.companyPaused;
   }
 
+  /**
+   * Final actions that were released (task done) but have no recorded result:
+   * the outbox. The server executes these and records the result; after a
+   * crash, they are the actions that may or may not have run.
+   */
+  pendingActions(): { taskId: string; action: ProposedAction }[] {
+    const pending: { taskId: string; action: ProposedAction }[] = [];
+    for (const t of this.tasks.values()) {
+      if (t.state === 'done' && t.finalAction && !t.actionResult) pending.push({ taskId: t.id, action: toAction(t.finalAction)! });
+    }
+    return pending;
+  }
+
   // ───────────────────────── agents & company ─────────────────────────
 
   registerAgent(input: Omit<AgentProfile, 'paused' | 'benched'>): Result<AgentProfile> {
@@ -217,21 +236,37 @@ export class WorkflowEngine {
   createGoal(text: string, budgetTokens: number): Result<Goal> {
     if (!text?.trim()) return fail('goal text is empty');
     if (!Number.isFinite(budgetTokens) || budgetTokens <= 0) return fail('goal budget must be positive');
-    const goal: Goal = { id: this.newId(), text: text.trim(), budgetTokens, spentTokens: 0, warned: false };
+    const goal: Goal = {
+      id: this.newId(),
+      text: text.trim(),
+      budgetTokens,
+      spentTokens: 0,
+      warned: false,
+      status: 'open',
+      planRejections: 0,
+      escalationReason: null,
+    };
     this.emit('goal.created', { goalId: goal.id, data: { goal } });
     return ok({ ...goal });
   }
 
-  /** Gate 1. The orchestrator proposes a plan; the engine validates it or rejects it with reasons. */
+  /**
+   * Gate 1. The orchestrator proposes a plan; the engine validates it or
+   * rejects it with reasons. After `maxReplans` re-plans the goal escalates.
+   */
   submitPlan(goalId: string, orchestratorId: string, plan: PlanTask[]): Result<Task[]> {
     const goal = this.goals.get(goalId);
     if (!goal) return fail(`unknown goal "${goalId}"`);
     const orchestrator = this.agents.get(orchestratorId);
     if (!orchestrator || orchestrator.kind !== 'orchestrator') return fail('plans must come from the orchestrator');
+    if (goal.status !== 'open') return fail(`goal is ${goal.status}, not open`);
 
     const errors = validatePlan(plan, { goal, agents: this.agents, policy: this.policy });
     if (errors.length) {
       this.emit('plan.rejected', { goalId, agentId: orchestratorId, data: { errors } });
+      if (goal.planRejections > this.limits.maxReplans) {
+        this.emit('goal.escalated', { goalId, data: { reason: `plan rejected ${goal.planRejections} times` } });
+      }
       return fail(`plan rejected: ${errors.join('; ')}`);
     }
 
@@ -252,7 +287,9 @@ export class WorkflowEngine {
       lastActivityAt: null,
       reviewAttempts: 0,
       summary: null,
+      artifacts: [],
       finalAction: null,
+      actionResult: null,
       lastFeedback: null,
       escalationReason: null,
     }));
@@ -296,6 +333,24 @@ export class WorkflowEngine {
 
     this.enforceGoalBudget(t.goalId);
     return ok(t.state);
+  }
+
+  /**
+   * Record one model turn by an orchestrator (planning) or a reviewer
+   * (reviewing) for a goal. Their work happens outside any task, so it is
+   * charged to the goal budget. Real usage is always recorded; the budget
+   * is enforced afterwards.
+   */
+  recordGoalStep(goalId: string, agentId: string, tokens: number): Result<true> {
+    const goal = this.goals.get(goalId);
+    if (!goal) return fail(`unknown goal "${goalId}"`);
+    const agent = this.agents.get(agentId);
+    if (!agent) return fail(`unknown agent "${agentId}"`);
+    if (agent.kind === 'worker') return fail('workers record steps on their task');
+    if (!Number.isFinite(tokens) || tokens < 0) return fail('tokens must be a non-negative number');
+    this.emit('goal.step', { goalId, agentId, data: { tokens } });
+    this.enforceGoalBudget(goalId);
+    return ok(true);
   }
 
   /**
@@ -362,6 +417,15 @@ export class WorkflowEngine {
       return fail(`self-check incomplete: ${missing.join('; ')}`);
     }
 
+    const artifacts = submission.artifacts ?? [];
+    if (
+      !Array.isArray(artifacts) ||
+      artifacts.length > MAX_ARTIFACTS ||
+      !artifacts.every((a) => typeof a === 'string' && a.trim() !== '' && a.length <= 500)
+    ) {
+      return fail(`artifacts must be up to ${MAX_ARTIFACTS} non-empty workspace paths`);
+    }
+
     let finalAction: FinalAction | null = null;
     if (submission.finalAction) {
       const fa = submission.finalAction;
@@ -372,7 +436,7 @@ export class WorkflowEngine {
       finalAction = { tool: fa.tool, input: fa.input, idempotencyKey: fa.idempotencyKey, needsApproval: decision.kind === 'needs_approval' };
     }
 
-    this.emit('task.submitted', { ...base, data: { summary: submission.summary.trim(), finalAction } });
+    this.emit('task.submitted', { ...base, data: { summary: submission.summary.trim(), artifacts: artifacts.map((a) => a.trim()), finalAction } });
     return ok(t.state);
   }
 
@@ -421,6 +485,22 @@ export class WorkflowEngine {
     this.emit('approval.rejected', { ...base, data: { note: decision.note.trim() } });
     if (t.reviewAttempts >= this.limits.maxReviewAttempts) this.escalateInternal(t, `rejected ${t.reviewAttempts} times`);
     return ok({ state: t.state, execute: null });
+  }
+
+  /**
+   * The gateway records what happened to a released final action, once.
+   * Never called by agents. A failed or interrupted action is recorded with
+   * `ok: false` so the CEO can see it; it is not retried automatically.
+   */
+  recordActionResult(taskId: string, idempotencyKey: string, result: ActionResult): Result<true> {
+    const t = this.tasks.get(taskId);
+    if (!t) return fail(`unknown task "${taskId}"`);
+    if (t.state !== 'done' || !t.finalAction) return fail('task is not done with a released final action');
+    if (t.finalAction.idempotencyKey !== idempotencyKey) return fail('idempotency key does not match the task\'s final action');
+    if (t.actionResult) return fail('action result already recorded');
+    const data = { idempotencyKey, tool: t.finalAction.tool, detail: String(result.detail ?? '') };
+    this.emit(result.ok ? 'action.executed' : 'action.failed', { goalId: t.goalId, taskId, agentId: t.ownerId, data });
+    return ok(true);
   }
 
   // ───────────────────────── escalation & safety ─────────────────────────
@@ -496,6 +576,7 @@ export class WorkflowEngine {
     if (!goal) return;
     const used = goal.spentTokens / goal.budgetTokens;
     if (used >= 1) {
+      if (goal.status === 'open') this.emit('goal.escalated', { goalId, data: { reason: 'goal budget exhausted' } });
       for (const t of this.tasks.values()) {
         if (t.goalId === goalId && (t.state === 'working' || t.state === 'assigned' || t.state === 'planned')) {
           this.escalateInternal(t, 'goal budget exhausted');
@@ -557,16 +638,45 @@ export class WorkflowEngine {
         this.companyPaused = false;
         break;
       case 'goal.created':
-        this.goals.set(d.goal.id, { ...d.goal });
+        // Older logs have no planning fields.
+        this.goals.set(d.goal.id, { status: 'open', planRejections: 0, escalationReason: null, ...d.goal });
         break;
-      case 'plan.accepted':
-        for (const task of d.tasks as Task[]) this.tasks.set(task.id, structuredClone(task));
+      case 'goal.step': {
+        this.goals.get(e.goalId!)!.spentTokens += d.tokens;
+        break;
+      }
+      case 'goal.escalated': {
+        const goal = this.goals.get(e.goalId!)!;
+        goal.status = 'escalated';
+        goal.escalationReason = d.reason;
+        break;
+      }
+      case 'plan.rejected': {
+        const goal = this.goals.get(e.goalId!);
+        if (goal) goal.planRejections += 1;
+        break;
+      }
+      case 'plan.accepted': {
+        for (const task of d.tasks as Task[]) {
+          const copy = structuredClone(task);
+          // Older logs have no artifacts or action results.
+          copy.artifacts ??= [];
+          copy.actionResult ??= null;
+          this.tasks.set(copy.id, copy);
+        }
+        const goal = this.goals.get(e.goalId!);
+        if (goal) goal.status = 'planned';
+        break;
+      }
+      case 'action.executed':
+      case 'action.failed':
+        t!.actionResult = { ok: e.type === 'action.executed', detail: d.detail };
         break;
       case 'task.assigned':
         this.move(t!, 'assigned');
         t!.ownerId = d.ownerId;
         if (d.reset) {
-          Object.assign(t!, { steps: 0, tokens: 0, startedAt: null, lastActivityAt: null, reviewAttempts: 0, summary: null, finalAction: null, escalationReason: null });
+          Object.assign(t!, { steps: 0, tokens: 0, startedAt: null, lastActivityAt: null, reviewAttempts: 0, summary: null, artifacts: [], finalAction: null, actionResult: null, escalationReason: null });
           this.recentCalls.delete(t!.id);
         }
         break;
@@ -603,6 +713,7 @@ export class WorkflowEngine {
       case 'task.submitted':
         this.move(t!, 'review');
         t!.summary = d.summary;
+        t!.artifacts = [...(d.artifacts ?? [])];
         t!.finalAction = d.finalAction ?? null;
         touch();
         break;

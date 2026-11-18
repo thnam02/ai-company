@@ -34,6 +34,7 @@ const LIMIT_KEYS: readonly (keyof Limits)[] = [
   'stuckAfterMs',
   'circuitBreakerEscalations',
   'budgetWarnAt',
+  'maxReplans',
 ];
 
 export function loadCompanyConfig(path: string): CompanyConfig {

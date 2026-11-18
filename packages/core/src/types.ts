@@ -63,7 +63,12 @@ export interface Limits {
   circuitBreakerEscalations: number;
   /** Goal budget fraction that triggers a warning. */
   budgetWarnAt: number;
+  /** Rejected plans allowed after the first one before the goal is escalated. */
+  maxReplans: number;
 }
+
+/** open: waiting for a plan · planned: a plan was accepted · escalated: the CEO must step in. */
+export type GoalStatus = 'open' | 'planned' | 'escalated';
 
 export interface Goal {
   id: string;
@@ -71,6 +76,15 @@ export interface Goal {
   budgetTokens: number;
   spentTokens: number;
   warned: boolean;
+  status: GoalStatus;
+  planRejections: number;
+  escalationReason: string | null;
+}
+
+/** Outcome of executing a released final action, recorded once. */
+export interface ActionResult {
+  ok: boolean;
+  detail: string;
 }
 
 /** An action that has a real-world effect, executed by the tool gateway. */
@@ -102,7 +116,11 @@ export interface Task {
   lastActivityAt: number | null;
   reviewAttempts: number;
   summary: string | null;
+  /** Workspace paths the submitted work produced, shown to the reviewer. */
+  artifacts: string[];
   finalAction: FinalAction | null;
+  /** Set once the released final action has been executed (or given up on). */
+  actionResult: ActionResult | null;
   lastFeedback: string | null;
   escalationReason: string | null;
 }
