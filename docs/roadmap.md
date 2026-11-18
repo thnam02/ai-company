@@ -26,13 +26,15 @@ Status: `[x]` done · `[ ]` not started
 - [x] `updateAgent` command (`agent.updated` event) so CEO config changes apply on boot: revoked tools are revoked, agents removed from the config lose all tools and are paused
 - [x] 47 new tests (82 in total); Postgres tests run when `DATABASE_URL` is set (always in CI). See ADR 0002 for the durability design.
 
-## [ ] M2b · SQLite event store (local-first)
+## [x] M2b · SQLite event store (local-first)
 
-- [ ] `SqliteEventStore` implementing `DurableEventStore` with `better-sqlite3`; writes are synchronous, so an append is durable before it returns and `flush()` is trivial (ADR 0002 still holds)
-- [ ] Same guarantees as the Postgres store: append-only (triggers reject UPDATE and DELETE), `seq` primary key, one writer per file (exclusive lock), event JSON stored as text so key order and every string survive
-- [ ] The server picks the store from config: `DATABASE_URL` set → Postgres; otherwise SQLite at `DATA_DIR` (default `./data/company.db`)
-- [ ] The existing crash/restart test runs against both stores
-- [ ] `npm run server` works on a fresh Mac with no database server installed
+- [x] `SqliteEventStore` implementing `DurableEventStore` with `better-sqlite3`; writes are synchronous: `flush()` commits a command's events in one transaction before it returns, in the same tick as the command (per-append commits would let a crash leave half a command in the log; see ADR 0002)
+- [x] Same guarantees as the Postgres store: append-only (triggers reject UPDATE, DELETE and INSERT OR REPLACE), `seq` primary key, one writer per file (sidecar lock plus EXCLUSIVE locking mode, checked across processes), event JSON stored as text so key order and every string survive
+- [x] The server picks the store from config: `DATABASE_URL` set → Postgres; otherwise SQLite at `DATA_DIR` (default `./data/company.db`)
+- [x] The existing crash/restart test runs against both stores
+- [x] `npm run server` works on a fresh Mac with no database server installed (better-sqlite3 ships prebuilt binaries)
+- [x] 17 new tests (99 in total with Postgres, 84 without); the shared in-memory log and failure handling live in one base class for both stores
+- [x] Hardened after review: a sidecar lock file keeps a second server out even if the process drops its lock on the log, full fsync from the first commit, private data directory, `DATA_DIR` anchored to the repo, a failed boot releases the log
 
 ## [ ] M3 · Agents with pluggable models: orchestrator, two workers, reviewer (`packages/agents`)
 

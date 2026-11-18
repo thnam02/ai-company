@@ -10,7 +10,7 @@ The core rule: **LLMs propose, deterministic code decides.** Agents can't change
 | --- | --- | --- |
 | Control plane: workflow engine, policy, limits, event log | `packages/core` | ✅ Done, 38 tests |
 | 3D office UI | `apps/office` | 🟡 Prototype with simulated agents |
-| Server, Postgres, WebSocket | `apps/server` | ✅ Done, 44 tests |
+| Server, SQLite or Postgres, WebSocket | `apps/server` | ✅ Done, 61 tests |
 | Real agents (Ollama local models, optional Claude) | `packages/agents` | ⬜ Milestone 3 |
 | Tool gateway | `packages/gateway` | ⬜ Milestone 4 |
 
@@ -22,19 +22,19 @@ Requires Node 22.18 or newer (runs TypeScript directly, no build step).
 
 ```bash
 npm install
-npm test             # all tests; Postgres tests are skipped unless DATABASE_URL is set
+npm test             # all tests; Postgres store tests are skipped unless DATABASE_URL is set
 npm run typecheck
 npm run office       # serve the 3D office prototype, then open the printed URL
 ```
 
-To run the server (needs Postgres):
+To run the server (no database server needed; the event log is a SQLite file at `./data/company.db`):
 
 ```bash
-createdb ai_company
-DATABASE_URL=postgres://localhost/ai_company CEO_TOKEN=$(openssl rand -hex 24) npm run server
+export CEO_TOKEN=$(openssl rand -hex 24)
+npm run server       # http://127.0.0.1:4100; call it with "Authorization: Bearer $CEO_TOKEN"
 ```
 
-To run the Postgres and crash/restart tests, point `DATABASE_URL` at a disposable database (each test uses its own schema and drops it).
+To use Postgres instead, set `DATABASE_URL` (e.g. `postgres://localhost/ai_company`). To run the Postgres store tests, and the crash/restart tests against Postgres as well as SQLite, point `DATABASE_URL` at a disposable database (each test uses its own schema and drops it).
 
 You can also open `apps/office/index.html` directly in a browser.
 
@@ -84,7 +84,7 @@ Start a session in the repo root and run `/milestone` to build the next mileston
 
 ```
 packages/core/   control plane (engine, policy, plan validation, state machine, event log) + tests
-apps/server/     Postgres event store, CEO HTTP API, WebSocket event stream, stuck timer + tests
+apps/server/     SQLite (default) and Postgres event stores, CEO HTTP API, WebSocket event stream, stuck timer + tests
 apps/office/     3D office prototype (Three.js, single file)
 docs/            architecture, roadmap, decision records
 .claude/         Claude Code commands, subagent and permissions

@@ -33,29 +33,32 @@ packages/core/        control plane (done): engine, policy, plan validation, sta
   src/state-machine.ts legal transitions
   src/event-log.ts    EventStore interface + in-memory store
   test/               node:test suites (helpers.ts builds a small test company)
-apps/server/          server (done): Postgres event store, CEO HTTP API, WebSocket stream, stuck timer
+apps/server/          server (done): SQLite/Postgres event store, CEO HTTP API, WebSocket stream, stuck timer
   src/app.ts          HTTP routes + the command queue `run()` (durable before visible, ADR 0002)
+  src/buffered-store.ts in-memory log, pending buffer and failure handling shared by both stores
+  src/sqlite-event-store.ts append-only SQLite log (default), single writer per file
   src/pg-event-store.ts append-only Postgres log, single writer
+  src/boot.ts         env config, store selection, boot sequence
   config/company.json tools, tiers, limits, agent roster (CEO config)
 apps/office/          3D office prototype (Three.js, single HTML file, simulated agents)
 docs/                 architecture.md, roadmap.md, decisions/ (ADRs)
 .claude/              commands and subagents for working on this repo
 ```
 
-Planned (see roadmap): SQLite event store in `apps/server` (M2b), `packages/agents` (`ModelProvider` with Ollama and Claude, our own agent loop, M3), `packages/gateway` (tool execution, M4), `apps/desktop` (Electron, M9).
+Planned (see roadmap): `packages/agents` (`ModelProvider` with Ollama and Claude, our own agent loop, M3), `packages/gateway` (tool execution, M4), `apps/desktop` (Electron, M9).
 
 ## Commands
 
-- `npm test` — run all tests (Node ≥ 22.18 runs `.ts` directly; no build step). Set `DATABASE_URL` to a disposable Postgres database to include the Postgres and crash/restart tests.
+- `npm test` — run all tests (Node ≥ 22.18 runs `.ts` directly; no build step). SQLite and crash/restart tests always run. Set `DATABASE_URL` to a disposable Postgres database to also run the Postgres store tests and the crash/restart tests against Postgres.
 - `npm run typecheck` — `tsc` strict type check
-- `npm run server` — start the server (needs `DATABASE_URL` and `CEO_TOKEN`)
+- `CEO_TOKEN=<16+ chars> npm run server` — start the server on `127.0.0.1:4100`. No database server needed: the event log is SQLite at `DATA_DIR/company.db` (default `<repo>/data`, git-ignored). Set `DATABASE_URL` (and optionally `DB_SCHEMA`) to use Postgres instead.
 - `npm run office` — serve the 3D office prototype
 
 ## Conventions
 
 - TypeScript, ESM, strict. Only erasable syntax (no `enum`, no `namespace`, no constructor parameter properties) so Node can strip types. Import local files with the `.ts` extension; use `import type` for types.
 - Keep `packages/core` dependency-free and free of I/O and LLM calls.
-- In `apps/server`, everything that leaves the process (responses, stream messages, gateway actions) goes through the command queue `run()`, which waits for the Postgres commit first. Build the response inside the function passed to `run()`; never read engine state after the await.
+- In `apps/server`, everything that leaves the process (responses, stream messages, gateway actions) goes through the command queue `run()`, which waits for the event store's commit first. Build the response inside the function passed to `run()`; never read engine state after the await.
 - Agent code calls engine commands only through `run()` and acts on a result (e.g. a tool `allow`) only after `run()` resolves.
 - New behaviour starts with a failing test in the matching `test/*.test.ts`. Use `makeCompany()` and `startedTask()` from `test/helpers.ts`.
 - A new event type needs: an emit in a command, a `case` in `apply()`, a test that replays it through `WorkflowEngine.fromEvents`.

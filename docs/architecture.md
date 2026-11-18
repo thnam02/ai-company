@@ -43,7 +43,7 @@ Agents send requests up to the control plane, which checks them against the rule
 | Component | Package | Status |
 | --- | --- | --- |
 | Workflow engine, policy engine, limits, event log | `packages/core` | Done |
-| Postgres event store, HTTP + WebSocket API | `apps/server` | Done |
+| SQLite and Postgres event stores, HTTP + WebSocket API | `apps/server` | Done |
 | Orchestrator, worker, reviewer agent loops | `packages/agents` | Milestones 3 and 6 |
 | Tool gateway and connectors | `packages/gateway` | Milestone 4 |
 | 3D office UI | `apps/office` | Prototype (simulated agents) |
@@ -145,9 +145,9 @@ Defaults are in `DEFAULT_LIMITS` (`packages/core/src/engine.ts`) and are proposa
 
 ## Reliability
 
-- **Event sourcing.** Every state change is an event appended to the log. The engine's state is built only by replaying events through one reducer (`apply`), so `WorkflowEngine.fromEvents(log)` rebuilds the company exactly. The server rebuilds the engine from Postgres on every boot.
-- **Durable before visible** ([ADR 0002](decisions/0002-durable-before-visible.md)). The engine stays synchronous; the server runs every request through one command queue that awaits a Postgres commit before anything leaves the process: HTTP responses, WebSocket messages and final actions for the gateway. A failed write stops the server, which then rebuilds from the log.
-- **One writer, append-only log.** The `events` table uses `seq` as its primary key, rejects UPDATE, DELETE and TRUNCATE, and is guarded by a Postgres advisory lock so only one server writes to a company's log.
+- **Event sourcing.** Every state change is an event appended to the log. The engine's state is built only by replaying events through one reducer (`apply`), so `WorkflowEngine.fromEvents(log)` rebuilds the company exactly. The server rebuilds the engine from the event store (a local SQLite file, or Postgres) on every boot.
+- **Durable before visible** ([ADR 0002](decisions/0002-durable-before-visible.md)). The engine stays synchronous; the server runs every request through one command queue that waits for the store's commit before anything leaves the process: HTTP responses, WebSocket messages and final actions for the gateway. A command's events commit in one transaction, so a crash never leaves half a command in the log. A failed write stops the server, which then rebuilds from the log.
+- **One writer, append-only log.** The `events` table uses `seq` as its primary key and rejects UPDATE and DELETE (and TRUNCATE in Postgres, INSERT OR REPLACE in SQLite). Only one server writes to a company's log: SQLite holds an exclusive lock on a sidecar `company.db.lock` plus an exclusive lock on the log (no other process can even read it while the server runs), Postgres a session advisory lock.
 - **Idempotency keys.** Every tool call and final action carries a key. A key is never allowed twice; a retry gets `{ kind: 'duplicate' }` and the gateway must not execute it again.
 - **Checkpoints.** After each agent step, progress and working notes are saved so a crashed agent resumes where it stopped. *(Milestone 3.)*
 - **Dead-letter queue.** Escalated tasks wait in one place for the CEO instead of disappearing or looping.
@@ -157,9 +157,9 @@ Defaults are in `DEFAULT_LIMITS` (`packages/core/src/engine.ts`) and are proposa
 
 The server hosts the engine for one company. Configuration (tools and tiers, `autoApproveTier2`, limits, the agent roster) comes from `apps/server/config/company.json`, written by the CEO. On boot the roster is brought in line with the config through engine commands: new agents go through `registerAgent`, changed ones through `updateAgent` (event `agent.updated`), so a tool removed from the config is revoked. An agent deleted from the config keeps its history but loses every tool and is paused; if it is added back, it stays paused until the CEO resumes it. Changing an agent's kind fails the boot (and writes nothing); give the agent a new id instead.
 
-The `events` table needs one direct connection per server (it holds a session advisory lock), so don't put a transaction-pooling proxy in front of it.
+**Event store.** By default the log is a SQLite file at `DATA_DIR/company.db` (`DATA_DIR` defaults to `<repo>/data` wherever the server is started from; the directory is created private, mode 0700), so the app needs no database server. The server logs when it creates a new, empty log, which is the sign of a wrong `DATA_DIR` or a missing `DATABASE_URL`. Commits are synchronous with `synchronous=FULL` and `fullfsync` (a real flush to disk on macOS), so each request costs one disk sync; that is plenty for one CEO on one machine. Back up the file only while the server is stopped, and never open it from inside the server process except through the store (see ADR 0002). Keep `DATA_DIR` out of folders synced by iCloud or Dropbox: sync tools ignore SQLite's locks. When `DATABASE_URL` is set, the server uses Postgres instead (for a hosted version later). The Postgres store needs one direct connection per server (it holds a session advisory lock), so don't put a transaction-pooling proxy in front of it.
 
-Environment: `DATABASE_URL` and `CEO_TOKEN` (16+ characters) are required. `DB_SCHEMA` (default `public`), `HOST` (default `127.0.0.1`), `PORT` (default `4100`) and `COMPANY_CONFIG` are optional.
+Environment: `CEO_TOKEN` (16+ characters) is required. Optional: `DATA_DIR` (SQLite, default `./data`), `DATABASE_URL` and `DB_SCHEMA` (Postgres, schema default `public`), `HOST` (default `127.0.0.1`), `PORT` (default `4100`) and `COMPANY_CONFIG`. The server logs which store it uses but never the database URL.
 
 `GET /health` is open. Every other route needs `Authorization: Bearer <CEO_TOKEN>`; the token is never accepted in an HTTP query string, which would leak into access logs. Engine refusals return 409 (or 404 for an unknown id) with the engine's reason.
 

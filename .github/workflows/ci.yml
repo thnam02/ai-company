@@ -23,7 +23,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      # Disposable CI database; enables the Postgres and crash/restart tests.
+      # Disposable CI database; adds the Postgres store tests and runs the crash/restart tests against Postgres too.
       DATABASE_URL: postgres://ci:ci@localhost:5432/ai_company_test
     steps:
       - uses: actions/checkout@v4
