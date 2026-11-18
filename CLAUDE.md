@@ -2,6 +2,8 @@
 
 An AI company workspace: AI agents work as employees in a 3D office. A CEO (the user) gives goals to an orchestrator agent, which plans tasks for worker agents; a reviewer agent checks the work. Read `docs/architecture.md` for the full design and `docs/roadmap.md` for what to build next.
 
+**Product direction: local-first desktop app.** Everything runs on the user's computer: the server on `127.0.0.1`, SQLite (Postgres optional), local models via Ollama (Claude API optional), and the 3D office in the browser, later wrapped in Electron. No cloud service may be required for the app to work. Reference machine: 16 GB Apple-silicon Mac running `qwen3:8b`.
+
 ## The one rule
 
 **LLMs propose, deterministic code decides.** Agents never change state, call a tool or spend money directly. Every action goes through `WorkflowEngine` in `packages/core`. If a change would let an agent bypass the engine, it is wrong — stop and ask.
@@ -18,6 +20,8 @@ An AI company workspace: AI agents work as employees in a 3D office. A CEO (the 
 8. Engine commands return `Result` (`{ ok: false, error }`) for bad agent input instead of throwing. Throwing is only for programmer errors (illegal transitions in `apply`).
 9. The reducer stays deterministic: no clock reads, randomness or I/O inside `apply()`; times and ids come from the event.
 10. Policies, limits and role templates are config changed by the CEO, never by an agent at runtime.
+11. The server binds to `127.0.0.1` by default and is never exposed on the network unless the CEO explicitly configures it.
+12. Model access goes only through the `ModelProvider` interface. `packages/core` never imports a model SDK, and agent code never hard-codes one vendor.
 
 ## Repo map
 
@@ -38,7 +42,7 @@ docs/                 architecture.md, roadmap.md, decisions/ (ADRs)
 .claude/              commands and subagents for working on this repo
 ```
 
-Planned (see roadmap): `packages/agents` (agent loops on the Claude Agent SDK), `packages/gateway` (tool execution).
+Planned (see roadmap): SQLite event store in `apps/server` (M2b), `packages/agents` (`ModelProvider` with Ollama and Claude, our own agent loop, M3), `packages/gateway` (tool execution, M4), `apps/desktop` (Electron, M9).
 
 ## Commands
 

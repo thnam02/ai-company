@@ -11,7 +11,7 @@ The core rule: **LLMs propose, deterministic code decides.** Agents can't change
 | Control plane: workflow engine, policy, limits, event log | `packages/core` | ✅ Done, 38 tests |
 | 3D office UI | `apps/office` | 🟡 Prototype with simulated agents |
 | Server, Postgres, WebSocket | `apps/server` | ✅ Done, 44 tests |
-| Real agents (Claude Agent SDK) | `packages/agents` | ⬜ Milestone 3 |
+| Real agents (Ollama local models, optional Claude) | `packages/agents` | ⬜ Milestone 3 |
 | Tool gateway | `packages/gateway` | ⬜ Milestone 4 |
 
 Full plan: [`docs/roadmap.md`](docs/roadmap.md) · Design: [`docs/architecture.md`](docs/architecture.md)

@@ -1,5 +1,7 @@
 # Roadmap
 
+**Direction (decided 2026-11-18): a local-first desktop app.** Everything runs on the user's own computer: the server on `127.0.0.1`, a SQLite event store (Postgres stays available for a hosted version later), local models through Ollama with an optional Claude API key, and the 3D office in the browser, later wrapped in Electron. No cloud service may be required for the app to work. Reference machine: a 16 GB Apple-silicon Mac running `qwen3:8b`.
+
 Build the parts that make real tools safe first. Each milestone is usable before the next starts. Work on one milestone at a time; a milestone is done only when every acceptance criterion holds and `npm test` and `npm run typecheck` pass.
 
 Status: `[x]` done · `[ ]` not started
@@ -24,14 +26,53 @@ Status: `[x]` done · `[ ]` not started
 - [x] `updateAgent` command (`agent.updated` event) so CEO config changes apply on boot: revoked tools are revoked, agents removed from the config lose all tools and are paused
 - [x] 47 new tests (82 in total); Postgres tests run when `DATABASE_URL` is set (always in CI). See ADR 0002 for the durability design.
 
-## [ ] M3 · Orchestrator and one worker (`packages/agents`)
+## [ ] M2b · SQLite event store (local-first)
 
-- [ ] Agent loop using the Claude Agent SDK; every model turn calls `recordStep` with real token counts
+- [ ] `SqliteEventStore` implementing `DurableEventStore` with `better-sqlite3`; writes are synchronous, so an append is durable before it returns and `flush()` is trivial (ADR 0002 still holds)
+- [ ] Same guarantees as the Postgres store: append-only (triggers reject UPDATE and DELETE), `seq` primary key, one writer per file (exclusive lock), event JSON stored as text so key order and every string survive
+- [ ] The server picks the store from config: `DATABASE_URL` set → Postgres; otherwise SQLite at `DATA_DIR` (default `./data/company.db`)
+- [ ] The existing crash/restart test runs against both stores
+- [ ] `npm run server` works on a fresh Mac with no database server installed
+
+## [ ] M3 · Agents with pluggable models: orchestrator, two workers, reviewer (`packages/agents`)
+
+- [ ] `ModelProvider` interface: `chat(messages, tools, opts) → { text, toolCalls, usage: { inputTokens, outputTokens } }`. Agent code never imports a vendor SDK directly
+- [ ] `OllamaProvider` for `http://localhost:11434`: tool calls, JSON-schema `format` for structured output, `think` on/off, `num_ctx`, `temperature`, token usage from `prompt_eval_count` / `eval_count`
+- [ ] `ClaudeProvider` (Anthropic API), used only when an API key is configured; the key never enters prompts, events or logs
+- [ ] Model per agent in the company config as `"<provider>:<model>"` (e.g. `"ollama:qwen3:8b"`, `"claude:claude-sonnet-5-5"`), with per-agent options `temperature`, `numCtx`, `think`
+- [ ] Provider-agnostic agent loop: model turn → `recordStep` with real token counts → each tool call through `requestToolCall` → execute only on `allow` → feed the result back
 - [ ] Agent loops get an allowlisted wrapper over the server's `run()` (`submitPlan`, `start`, `recordStep`, `requestToolCall`, `submitForReview`, `recordReview`, `escalate`), never the raw engine or CEO commands such as `updateAgent`
-- [ ] Orchestrator prompt that outputs a JSON plan matching `PlanTask[]`; rejected plans are fed back with the errors (max 3 re-plans, then escalate goal to CEO)
-- [ ] Engineering worker on a test GitHub repo with tools `repo.read` (tier 0) and `github.create_branch` / `github.open_pr` (tier 1)
-- [ ] Context packs: worker sees only its task, criteria and role memory
-- [ ] Checkpoint after each step; resume after crash
+- [ ] Orchestrator outputs a `PlanTask[]` JSON plan via structured output; rejected plans are fed back with the errors (max 3 re-plans, then escalate the goal to the CEO)
+- [ ] Reviewer outputs a `ReviewVerdict` JSON from the task's acceptance criteria and the worker's output (basic version; rubrics and automated checks come in M5)
+- [ ] Workspace tools sandboxed to `./workspace`: `files.read` (tier 0), `files.write` (tier 1, refuses any path outside the workspace) and a fake `email.send` (tier 3) that writes the email to `workspace/outbox/` instead of sending it
+- [ ] Context packs: a worker sees only its task, its criteria, the files it needs and its role memory
+- [ ] Checkpoint after each step; resume after a crash
+- [ ] One agent runs at a time by default (`maxConcurrentAgents: 1`) so one local model serves every agent on a 16 GB Mac; Ollama `keep_alive` frees the model when idle
+- [ ] Tests use a scripted fake provider (no real model in CI); one opt-in live test runs when `OLLAMA_URL` is set
+
+### M3 acceptance test: the test team
+
+Config `apps/server/config/test-team.json`:
+
+| Agent | Kind | Model and options | Tools |
+| --- | --- | --- | --- |
+| Ava | orchestrator | `ollama:qwen3:8b`, think on, temperature 0.2 | none |
+| Kai | worker (researcher) | `ollama:qwen3:8b`, think off, temperature 0.2, numCtx 16384 | `files.read`, `files.write` |
+| Zara | worker (writer) | `ollama:qwen3:8b`, think off, temperature 0.3, numCtx 16384 | `files.read`, `files.write`, `email.send` |
+| Rex | reviewer | `ollama:qwen3:8b`, think on, temperature 0.1 | none |
+
+Goal: "Write a one-page product brief for our 3D AI office from the notes in `workspace/notes/`, then draft a launch email to our team."
+
+End to end against a real `qwen3:8b`:
+
+- [ ] Ava's plan has two tasks, Zara's depending on Kai's; Zara starts only after Kai's task is done
+- [ ] Kai writes `workspace/brief.md`; Zara writes the email and proposes `email.send` as her final action
+- [ ] Rex reviews both; a failed review sends the work back with feedback
+- [ ] The email waits for CEO approval; after approval it appears in `workspace/outbox/` exactly once
+- [ ] Safety: impossible criteria escalate after 3 tries; a low step limit escalates; the kill switch stops work mid-task
+- [ ] A run report lists: plans accepted first try, re-plans, first-try review pass rate, tokens and time per task, peak memory
+
+Round 2 (manual comparison, not required for M3): the same goal with Ava and Rex on `claude:` models.
 
 ## [ ] M4 · Tool gateway (`packages/gateway`)
 
@@ -65,11 +106,20 @@ Status: `[x]` done · `[ ]` not started
 - [ ] Golden tasks per role; run on every prompt/model/tool change
 - [ ] Versioned prompts and policies recorded on each event; canary rollout and rollback
 
+## [ ] M9 · Desktop app (`apps/desktop`)
+
+- [ ] Electron shell that starts the server in-process (or a utility process) and opens the office in its window
+- [ ] Tray/menu-bar mode: closing the window keeps agents running; quitting stops them cleanly
+- [ ] First-run setup: detect Ollama, guide the install, recommend a model from available RAM (16 GB → `qwen3:8b`), pull it
+- [ ] API keys and tool logins in the OS keychain (`safeStorage`)
+- [ ] Pause the 3D render loop when the window is hidden; low-quality mode for weak machines
+- [ ] Packaging with electron-builder for macOS and Windows, auto-update, then code signing and notarization
+
 ## Open questions
 
 - [ ] Target customer: solo founders, SMBs, or developers? Decides which departments come first.
-- [ ] Hosting: our cloud only, or also self-hosted?
-- [ ] Agent framework: Claude Agent SDK (current assumption), LangGraph, or our own loop?
+- [x] Hosting: local-first desktop app now; a hosted version can reuse the Postgres store later (decided 2026-11-18)
+- [x] Agent framework: our own provider-agnostic loop, Ollama first, Claude optional (decided 2026-11-18)
 - [ ] Pricing: per agent seat, per task, or pass-through of token cost?
 - [ ] Who besides the CEO can approve tier-3 actions in a customer's company?
 - [ ] CEO auth: M2 uses one shared bearer token (`CEO_TOKEN`). Real users and sessions are needed before anyone else gets access.
