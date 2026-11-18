@@ -1,6 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { WorkflowEngine } from '@ai-company/core';
 import { bootstrapAgents, buildPolicy, loadCompanyConfig, parseCompanyConfig } from '../src/company.ts';
 import { DEFAULT_COMPANY_CONFIG, configFromEnv } from '../src/boot.ts';
@@ -82,7 +83,9 @@ describe('company config', () => {
     assert.throws(() => configFromEnv({}), /CEO_TOKEN is required/);
     assert.throws(() => configFromEnv({ CEO_TOKEN: 'short' }), /at least 16/);
     const local = configFromEnv({ CEO_TOKEN });
-    assert.deepEqual(local.store, { kind: 'sqlite', path: resolve('data', 'company.db') });
+    // Anchored to the repo, not the working directory, so every way of starting the server finds the same log.
+    assert.deepEqual(local.store, { kind: 'sqlite', path: fileURLToPath(new URL('../../../data/company.db', import.meta.url)) });
+    assert.deepEqual(configFromEnv({ CEO_TOKEN, DATA_DIR: 'elsewhere' }).store, { kind: 'sqlite', path: resolve('elsewhere', 'company.db') });
     assert.equal(local.host, '127.0.0.1');
     assert.equal(local.port, 4100);
     assert.deepEqual(configFromEnv({ CEO_TOKEN, DATA_DIR: '/srv/acme' }).store, { kind: 'sqlite', path: '/srv/acme/company.db' });

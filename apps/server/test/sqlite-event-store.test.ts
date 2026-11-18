@@ -1,16 +1,22 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { once } from 'node:events';
+import { closeSync, existsSync, mkdtempSync, openSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:net';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 import { WorkflowEngine } from '@ai-company/core';
 import { SqliteEventStore } from '../src/sqlite-event-store.ts';
-import { makePolicy, registerTestAgents } from './helpers.ts';
+import { createCompanyServer } from '../src/app.ts';
+import { boot } from '../src/boot.ts';
+import { TEST_CONFIG, makePolicy, registerTestAgents } from './helpers.ts';
 
 const SERVER_DIR = fileURLToPath(new URL('..', import.meta.url));
+const STORE_URL = new URL('../src/sqlite-event-store.ts', import.meta.url).href;
 
 describe('SqliteEventStore', () => {
   let dir: string;
@@ -112,11 +118,81 @@ describe('SqliteEventStore', () => {
       try { db.prepare('SELECT count(*) AS n FROM events').get(); console.log('READ'); }
       catch (e) { console.log(e.code); }
     `;
-    const busy = spawnSync(process.execPath, ['-e', script, path], { cwd: SERVER_DIR, encoding: 'utf8' });
+    const tryRead = () => spawnSync(process.execPath, ['-e', script, path], { cwd: SERVER_DIR, encoding: 'utf8' });
+    const busy = tryRead();
     assert.equal(busy.stdout.trim(), 'SQLITE_BUSY', busy.stderr);
     await store.close();
-    const free = spawnSync(process.execPath, ['-e', script, path], { cwd: SERVER_DIR, encoding: 'utf8' });
+    const free = tryRead();
     assert.equal(free.stdout.trim(), 'READ', free.stderr);
+    // Reopening a file that is already in WAL mode takes the lock again.
+    const reopened = open();
+    assert.equal(tryRead().stdout.trim(), 'SQLITE_BUSY');
+    await reopened.close();
+  });
+
+  test('a second server is refused even after something in this process opens and closes the file', async () => {
+    // POSIX locks belong to the process: closing any descriptor on company.db
+    // drops SQLite's lock on it. The sidecar lock file must still refuse a
+    // second server.
+    const store = open();
+    store.append({ type: 'a', at: 1 });
+    await store.flush();
+    closeSync(openSync(path, 'r'));
+    const script = `
+      import { SqliteEventStore } from ${JSON.stringify(STORE_URL)};
+      try { SqliteEventStore.open({ path: process.argv[1], lockTimeoutMs: 200 }); console.log('OPENED'); }
+      catch (e) { console.log(e.message); }
+    `;
+    const second = spawnSync(process.execPath, ['--input-type=module', '-e', script, path], { cwd: SERVER_DIR, encoding: 'utf8' });
+    assert.match(second.stdout, /another server holds the event log/, second.stderr);
+    store.append({ type: 'b', at: 2 });
+    await store.flush();
+    await store.close();
+    const reopened = open();
+    assert.deepEqual(reopened.all().map((e) => e.type), ['a', 'b']);
+    await reopened.close();
+  });
+
+  test('runs with WAL, exclusive locking and full fsync, in a private directory', async () => {
+    const store = open();
+    assert.deepEqual(store.settings(), { journalMode: 'wal', lockingMode: 'exclusive', synchronous: 2, fullfsync: 1, checkpointFullfsync: 1 });
+    assert.equal(statSync(dirname(path)).mode & 0o777, 0o700);
+    await store.close();
+  });
+
+  test('a command that throws inside run() writes nothing', async () => {
+    const store = open();
+    const engine = new WorkflowEngine({ policy: makePolicy(), store });
+    const fatal: Error[] = [];
+    const server = createCompanyServer({ engine, store, ceoToken: 'x'.repeat(16), onFatal: (e) => fatal.push(e), log: () => {} });
+    await server.run(() => registerTestAgents(engine));
+    const size = store.size;
+    await assert.rejects(
+      server.run(() => {
+        engine.createGoal('half done', 1_000);
+        throw new Error('bug after append');
+      }),
+      /bug after append/,
+    );
+    assert.equal(fatal.length, 1);
+    await server.close();
+    await store.close();
+    const reopened = open();
+    assert.equal(reopened.size, size);
+    await reopened.close();
+  });
+
+  test('a failed boot releases the event log', async () => {
+    const configPath = join(dir, 'company.json');
+    writeFileSync(configPath, JSON.stringify(TEST_CONFIG));
+    const blocker = createServer().listen(0, '127.0.0.1');
+    await once(blocker, 'listening');
+    const port = (blocker.address() as AddressInfo).port;
+    const config = { store: { kind: 'sqlite' as const, path }, ceoToken: 'x'.repeat(16), host: '127.0.0.1', port, companyConfigPath: configPath };
+    await assert.rejects(boot(config, { onFatal: () => {} }), /EADDRINUSE/);
+    blocker.close();
+    const running = await boot({ ...config, port: 0 }, { onFatal: () => {} });
+    await running.stop();
   });
 
   test('a failed write rolls back the whole batch and poisons the store', async () => {

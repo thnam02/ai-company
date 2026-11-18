@@ -20,6 +20,12 @@ export interface BootConfig {
 }
 
 export const DEFAULT_COMPANY_CONFIG = fileURLToPath(new URL('../config/company.json', import.meta.url));
+/**
+ * `<repo>/data`, whatever directory the server is started from, so every way
+ * of starting it finds the same company. A relative DATA_DIR resolves against
+ * the working directory as usual.
+ */
+export const DEFAULT_DATA_DIR = fileURLToPath(new URL('../../../data', import.meta.url));
 
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): BootConfig {
   const ceoToken = env.CEO_TOKEN;
@@ -29,7 +35,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): BootConfig 
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('PORT must be a port number');
   const store: StoreConfig = env.DATABASE_URL
     ? { kind: 'postgres', databaseUrl: env.DATABASE_URL, schema: env.DB_SCHEMA || 'public' }
-    : { kind: 'sqlite', path: resolve(env.DATA_DIR || 'data', 'company.db') };
+    : { kind: 'sqlite', path: resolve(env.DATA_DIR || DEFAULT_DATA_DIR, 'company.db') };
   return {
     store,
     ceoToken,
@@ -66,46 +72,61 @@ export async function boot(config: BootConfig, hooks: { onExecute?: (action: Pro
   const log = (m: string) => console.error(`[server] ${m}`);
   const company = loadCompanyConfig(config.companyConfigPath);
   const store = await openStore(config.store);
-  const engine = new WorkflowEngine({ policy: buildPolicy(company), store, limits: company.limits });
   // Never log the database URL: it can carry a password.
   log(`event store: ${config.store.kind === 'sqlite' ? `SQLite at ${config.store.path}` : `Postgres, schema "${config.store.schema}"`}`);
-  log(`replayed ${store.size} events`);
+  if (store instanceof SqliteEventStore && store.created) log('created a new, empty event log (a new company)');
 
-  const server = createCompanyServer({
-    engine,
-    store,
-    ceoToken: config.ceoToken,
-    log,
-    onExecute: hooks.onExecute,
-    onFatal: hooks.onFatal ?? (() => process.exit(1)),
-  });
+  let server: CompanyServer | undefined;
+  let stopTimer: (() => void) | undefined;
+  try {
+    const engine = new WorkflowEngine({ policy: buildPolicy(company), store, limits: company.limits });
+    log(`replayed ${store.size} events`);
 
-  // Throwing inside `run` makes the failure fatal before anything is flushed,
-  // so a bootstrap that fails halfway leaves the log untouched.
-  const report = await server.run(() => {
-    const r = bootstrapAgents(engine, company);
-    if (!r.ok) throw new Error(r.error);
-    return r.value;
-  });
-  if (report.registered.length) log(`registered agents: ${report.registered.join(', ')}`);
-  if (report.updated.length) log(`updated agents from config: ${report.updated.join(', ')}`);
-  if (report.retired.length) log(`retired agents (not in config; tools revoked, paused): ${report.retired.join(', ')}`);
+    server = createCompanyServer({
+      engine,
+      store,
+      ceoToken: config.ceoToken,
+      log,
+      onExecute: hooks.onExecute,
+      onFatal: hooks.onFatal ?? (() => process.exit(1)),
+    });
+    const { run, http } = server;
 
-  const stopTimer = startStuckTimer({ run: server.run, engine, log });
-  await new Promise<void>((resolve, reject) => {
-    server.http.once('error', reject);
-    server.http.listen(config.port, config.host, () => resolve());
-  });
-  const address = server.http.address();
-  const port = typeof address === 'object' && address ? address.port : config.port;
+    // Throwing inside `run` makes the failure fatal before anything is flushed,
+    // so a bootstrap that fails halfway leaves the log untouched.
+    const report = await run(() => {
+      const r = bootstrapAgents(engine, company);
+      if (!r.ok) throw new Error(r.error);
+      return r.value;
+    });
+    if (report.registered.length) log(`registered agents: ${report.registered.join(', ')}`);
+    if (report.updated.length) log(`updated agents from config: ${report.updated.join(', ')}`);
+    if (report.retired.length) log(`retired agents (not in config; tools revoked, paused): ${report.retired.join(', ')}`);
 
-  return {
-    server,
-    url: `http://${config.host}:${port}`,
-    async stop() {
-      stopTimer();
-      await server.close();
-      await store.close({ flush: !server.failed });
-    },
-  };
+    stopTimer = startStuckTimer({ run, engine, log });
+    await new Promise<void>((resolve, reject) => {
+      http.once('error', reject);
+      http.listen(config.port, config.host, () => resolve());
+    });
+    const address = http.address();
+    const port = typeof address === 'object' && address ? address.port : config.port;
+
+    const running = server;
+    const stopTicks = stopTimer;
+    return {
+      server: running,
+      url: `http://${config.host}:${port}`,
+      async stop() {
+        stopTicks();
+        await running.close();
+        await store.close({ flush: !running.failed });
+      },
+    };
+  } catch (err) {
+    // Release the log (and its lock) so a retry in this process can open it.
+    stopTimer?.();
+    await server?.close().catch(() => {});
+    await store.close({ flush: false }).catch(() => {});
+    throw err;
+  }
 }
