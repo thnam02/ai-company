@@ -1,6 +1,6 @@
 import type { Goal, PlanTask, Task } from '@ai-company/core';
 import type { CheckpointStore } from './checkpoints.ts';
-import { PLAN_SCHEMA, VERDICT_SCHEMA, feedbackMessage, plannerPrompt, reviewerPrompt, workerSystem, workerTask } from './context.ts';
+import { PLAN_SCHEMA, VERDICT_SCHEMA, feedbackMessage, newFenceTag, plannerPrompt, reviewerPrompt, workerSystem, workerTask } from './context.ts';
 import { totalTokens, type ChatMessage, type ModelOptions, type ModelProvider, type ToolCall, type ToolDefinition } from './model.ts';
 import type { AgentPort, AgentView, CompanyView } from './port.ts';
 import type { ToolRegistry } from './tools/registry.ts';
@@ -44,6 +44,7 @@ export async function runPlanner(ctx: RoleContext, goal: Goal, view: CompanyView
   const messages: ChatMessage[] = [{ role: 'system', content: system }, { role: 'user', content: user }];
   let progress = false;
   for (;;) {
+    if (!(await mayWork(ctx))) return progress;
     const result = await chat(ctx, messages, undefined, PLAN_SCHEMA);
     const recorded = await ctx.port.recordGoalStep(goal.id, ctx.agent.id, totalTokens(result.usage));
     if (!recorded.ok) {
@@ -103,9 +104,10 @@ export async function runWorker(ctx: RoleContext, task: Task, view: CompanyView)
     if (task.reviewAttempts > saved.attempt) messages.push({ role: 'user', content: feedbackMessage(task.lastFeedback) });
   } else {
     const goal = view.goals.find((g) => g.id === task.goalId);
+    const tag = newFenceTag();
     messages = [
-      { role: 'system', content: workerSystem(agent) },
-      { role: 'user', content: workerTask(task, goal, view, finalTools) },
+      { role: 'system', content: workerSystem(agent, tag) },
+      { role: 'user', content: workerTask(task, goal, view, finalTools, tag) },
     ];
   }
   const checkpoint = () => ctx.checkpoints.save({ taskId: task.id, agentId: agent.id, run, attempt: task.reviewAttempts, messages });
@@ -271,30 +273,41 @@ export async function runReviewer(ctx: RoleContext, task: Task): Promise<Progres
   });
   const { system, user } = reviewerPrompt(ctx.agent, task, files);
   const messages: ChatMessage[] = [{ role: 'system', content: system }, { role: 'user', content: user }];
-  let progress = false;
   for (let attempt = 0; attempt < 3; attempt++) {
+    if (!(await mayWork(ctx))) return false;
     const result = await chat(ctx, messages, undefined, VERDICT_SCHEMA);
     const recorded = await ctx.port.recordGoalStep(task.goalId, ctx.agent.id, totalTokens(result.usage));
-    if (!recorded.ok) return progress;
-    progress = true;
+    if (!recorded.ok) return false;
     const v = parseJson(result.text);
     if (v && typeof v.passed === 'boolean' && typeof v.feedback === 'string') {
       const score = typeof v.score === 'number' && Number.isFinite(v.score) ? Math.min(1, Math.max(0, v.score)) : v.passed ? 1 : 0;
       const reviewed = await ctx.port.recordReview(task.id, ctx.agent.id, { passed: v.passed, score, feedback: v.feedback });
       if (reviewed.ok) {
         ctx.log(`${ctx.agent.name} ${v.passed ? 'passed' : 'sent back'} "${task.title}"`);
-        return progress;
+        return true;
       }
+      // The task moved on (paused company, budget, CEO): stop instead of retrying.
+      const now = (await ctx.port.view()).tasks.find((t) => t.id === task.id);
+      if (now?.state !== 'review') return false;
       messages.push({ role: 'assistant', content: result.text }, { role: 'user', content: `That verdict was refused: ${reviewed.error}. Answer again.` });
     } else {
       messages.push({ role: 'assistant', content: result.text }, { role: 'user', content: 'Answer only with JSON: {"passed": boolean, "score": number, "feedback": string}.' });
     }
   }
+  // Not progress: the runtime moves on to other work and backs off, and the
+  // goal budget (which also covers tasks in review) bounds the retries.
   ctx.log(`${ctx.agent.name} gave no usable verdict for "${task.title}"; will try again later`);
-  return progress;
+  return false;
 }
 
 // ───────────────────────── shared ─────────────────────────
+
+/** Before every model turn: the kill switch, a pause or the bench stops the agent. */
+async function mayWork(ctx: RoleContext): Promise<boolean> {
+  const view = await ctx.port.view();
+  const me = view.agents.find((a) => a.id === ctx.agent.id);
+  return !view.companyPaused && !!me && !me.paused && !me.benched;
+}
 
 function chat(ctx: RoleContext, messages: ChatMessage[], tools?: ToolDefinition[], format?: Record<string, unknown>) {
   return ctx.model.provider.chat(

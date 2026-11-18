@@ -94,7 +94,7 @@ describe('OllamaProvider', () => {
     });
     const result = await new OllamaProvider({ baseUrl: url }).chat({ model: 'qwen3:8b', messages: [{ role: 'user', content: 'hi' }] });
     assert.deepEqual(result.toolCalls, [{ id: 'x9', name: 'files.write', arguments: { path: 'a.md', content: 'hi' } }]);
-    assert.deepEqual(result.usage, { inputTokens: 0, outputTokens: 0 });
+    assert.equal(result.usage.estimated, true, 'no counts sent, so they are estimated');
     assert.deepEqual(Object.keys(fake.bodies[0].body).sort(), ['keep_alive', 'messages', 'model', 'stream']);
   });
 
@@ -109,6 +109,15 @@ describe('OllamaProvider', () => {
     fake.replies.push({ body: { message: { content: '', tool_calls: [{ function: { name: 'files.write', arguments: '{oops' } }] } } });
     const result = await new OllamaProvider({ baseUrl: url }).chat({ model: 'm', messages: [] });
     assert.deepEqual(result.toolCalls[0].arguments, { _invalidArguments: '{oops' });
+  });
+
+  test('missing token counts are estimated, never recorded as zero', async () => {
+    fake.replies.push({ body: { message: { role: 'assistant', content: 'x'.repeat(400) }, done: true } });
+    const provider = new OllamaProvider({ baseUrl: url });
+    const result = await provider.chat({ model: 'qwen3:8b', messages: [{ role: 'user', content: 'y'.repeat(800) }] });
+    assert.ok(result.usage.inputTokens >= 200, `input estimate ${result.usage.inputTokens}`);
+    assert.ok(result.usage.outputTokens >= 100, `output estimate ${result.usage.outputTokens}`);
+    assert.equal(result.usage.estimated, true);
   });
 
   test('model refs name the provider and the model', () => {

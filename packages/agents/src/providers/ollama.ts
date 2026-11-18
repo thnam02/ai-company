@@ -1,4 +1,4 @@
-import type { ChatMessage, ChatRequest, ChatResult, ModelProvider, ToolCall } from '../model.ts';
+import type { ChatMessage, ChatRequest, ChatResult, ModelProvider, ToolCall, Usage } from '../model.ts';
 
 export interface OllamaOptions {
   /** Default http://127.0.0.1:11434. */
@@ -67,7 +67,7 @@ export class OllamaProvider implements ModelProvider {
     return {
       text: typeof message.content === 'string' ? message.content : '',
       toolCalls,
-      usage: { inputTokens: count(json.prompt_eval_count), outputTokens: count(json.eval_count) },
+      usage: usage(json, body.messages as unknown[], message),
     };
   }
 }
@@ -99,4 +99,17 @@ function parseArguments(args: unknown): Record<string, unknown> {
   return {};
 }
 
-const count = (n: unknown): number => (typeof n === 'number' && Number.isFinite(n) && n >= 0 ? Math.round(n) : 0);
+const count = (n: unknown): number | undefined => (typeof n === 'number' && Number.isFinite(n) && n >= 0 ? Math.round(n) : undefined);
+
+/**
+ * Real counts from Ollama. If a count is missing, estimate it (about 4
+ * characters per token) rather than record 0, which would let a goal spend
+ * past its budget unseen.
+ */
+function usage(json: any, sent: unknown[], message: unknown): Usage {
+  const input = count(json.prompt_eval_count);
+  const output = count(json.eval_count);
+  if (input !== undefined && output !== undefined) return { inputTokens: input, outputTokens: output };
+  const estimate = (v: unknown) => Math.ceil(JSON.stringify(v ?? '').length / 4);
+  return { inputTokens: input ?? estimate(sent), outputTokens: output ?? estimate(message), estimated: true };
+}

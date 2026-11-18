@@ -41,6 +41,8 @@ export interface ChatRequest {
 export interface Usage {
   inputTokens: number;
   outputTokens: number;
+  /** True when the provider gave no counts and these are estimates (about 4 characters per token). */
+  estimated?: boolean;
 }
 
 export interface ChatResult {

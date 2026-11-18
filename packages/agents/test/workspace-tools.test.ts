@@ -75,10 +75,11 @@ describe('workspace tools', () => {
     await assert.rejects(run('email.send', { ...email, to: 'a\nBcc: evil@x.com' }, 'mail-4'), /to/);
   });
 
-  test('every workspace tool dedupes by idempotency key, so a crash re-run is safe', () => {
+  test('only tools that cannot act twice say they dedupe, so a crash re-run is safe', () => {
+    // files.write is not: re-running an old write after a crash could undo a later one.
     assert.deepEqual(tools.list().map((t) => [t.name, t.dedupesByKey]), [
       ['files.read', true],
-      ['files.write', true],
+      ['files.write', false],
       ['email.send', true],
     ]);
   });

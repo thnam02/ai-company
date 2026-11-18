@@ -116,8 +116,8 @@ export function workspaceTools(ws: Workspace): ToolExecutor[] {
         properties: { path: { type: 'string', description: 'Path relative to the workspace' }, content: { type: 'string' } },
         required: ['path', 'content'],
       },
-      // Writing the same content again leaves the same file.
-      dedupesByKey: true,
+      // Not safe to re-run after a crash: an old write could undo a newer one.
+      dedupesByKey: false,
       run: async (input) => ws.write(field(input, 'path'), field(input, 'content')),
     },
     {
