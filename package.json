@@ -5,15 +5,17 @@
   "description": "An AI company workspace: AI agents work as employees in a 3D office, run by a deterministic control plane.",
   "type": "module",
   "workspaces": [
-    "packages/*"
+    "packages/*",
+    "apps/server"
   ],
   "engines": {
     "node": ">=22.18"
   },
   "scripts": {
-    "test": "node --test \"packages/*/test/**/*.test.ts\"",
+    "test": "node --test \"packages/*/test/**/*.test.ts\" \"apps/*/test/**/*.test.ts\"",
     "typecheck": "tsc -p tsconfig.json",
-    "office": "npx --yes serve apps/office"
+    "office": "npx --yes serve apps/office",
+    "server": "node apps/server/src/main.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

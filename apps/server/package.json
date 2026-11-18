@@ -1,0 +1,19 @@
+{
+  "name": "@ai-company/server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Control-plane server: Postgres event store, CEO HTTP API and WebSocket event stream.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.ts"
+  },
+  "dependencies": {
+    "@ai-company/core": "0.1.0",
+    "pg": "^8.23.1",
+    "ws": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.23.1",
+    "@types/ws": "^8.18.2"
+  }
+}
