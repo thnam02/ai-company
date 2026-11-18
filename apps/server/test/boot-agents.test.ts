@@ -27,7 +27,18 @@ describe('booting with agents', () => {
     const on = configFromEnv({ ...base, AGENTS: 'on', WORKSPACE_DIR: 'ws', OLLAMA_URL: 'http://127.0.0.1:9999', DATA_DIR: '/srv/x' });
     assert.deepEqual(on.agents, { enabled: true, workspaceDir: resolve('ws'), ollamaUrl: 'http://127.0.0.1:9999' });
     assert.deepEqual(on.store, { kind: 'sqlite', path: '/srv/x/company.db' });
-    assert.throws(() => configFromEnv({ ...base, AGENTS: 'yes' }), /AGENTS must be "on" or "off"/);
+    assert.throws(() => configFromEnv({ ...base, AGENTS: 'yes' }), /AGENTS must be "on" or "off"/);  });
+
+  test('the workspace may not hold the event log, the checkpoints or the CEO config', () => {
+    const base = { CEO_TOKEN: TOKEN, DATA_DIR: '/srv/co/data', COMPANY_CONFIG: '/srv/co/config/company.json' };
+    assert.throws(() => configFromEnv({ ...base, WORKSPACE_DIR: '/srv/co' }), /must not contain each other/);
+    assert.throws(() => configFromEnv({ ...base, WORKSPACE_DIR: '/srv/co/data' }), /must not contain each other/);
+    assert.throws(() => configFromEnv({ ...base, WORKSPACE_DIR: '/srv/co/data/ws' }), /must not contain each other/);
+    assert.throws(() => configFromEnv({ ...base, WORKSPACE_DIR: '/srv/co/config' }), /company config/);
+    assert.equal(configFromEnv({ ...base, WORKSPACE_DIR: '/srv/co/workspace' }).agents.workspaceDir, '/srv/co/workspace');
+    assert.equal(configFromEnv({ ...base, WORKSPACE_DIR: '/srv/co/database' }).agents.workspaceDir, '/srv/co/database', 'a sibling with a shared prefix is fine');
+    // The repo defaults never overlap.
+    assert.doesNotThrow(() => configFromEnv({ CEO_TOKEN: TOKEN }));
   });
 
   test('checkpoints survive a restart, and only one server may hold the file', () => {

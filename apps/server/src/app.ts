@@ -119,17 +119,25 @@ export function createCompanyServer(options: ServerOptions): CompanyServer {
     return r.value;
   };
 
-  const executing = new Set<string>();
+  /** Final actions running now, by idempotency key; `close()` waits for them. */
+  const executing = new Map<string, Promise<void>>();
 
   /**
    * Executes a released final action and records its result through the
    * engine. Called only after the release is durable. A key already being
    * executed in this process is skipped; across a crash, recoverActions decides.
    */
-  const execute = async (action: ProposedAction, taskId: string, tools: ToolRegistry): Promise<void> => {
+  const execute = (action: ProposedAction, taskId: string, tools: ToolRegistry): Promise<void> => {
     const key = action.idempotencyKey;
-    if (executing.has(key)) return;
-    executing.add(key);
+    const running = executing.get(key);
+    if (running) return running;
+    const done = executeOnce(action, taskId, tools).finally(() => executing.delete(key));
+    executing.set(key, done);
+    return done;
+  };
+
+  const executeOnce = async (action: ProposedAction, taskId: string, tools: ToolRegistry): Promise<void> => {
+    const key = action.idempotencyKey;
     try {
       const result = await tools.executeAction(action);
       const recorded = await run(() => engine.recordActionResult(taskId, key, result));
@@ -138,8 +146,6 @@ export function createCompanyServer(options: ServerOptions): CompanyServer {
     } catch (err) {
       // `run` failing means the server has gone fatal; the action stays pending for the next boot.
       log(`final action ${action.tool} for task ${taskId} was not recorded: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      executing.delete(key);
     }
   };
 
@@ -320,6 +326,9 @@ export function createCompanyServer(options: ServerOptions): CompanyServer {
       return failure !== null;
     },
     async close() {
+      // A released action that is running finishes and records its result
+      // before the server (and then the store) closes.
+      await Promise.allSettled([...executing.values()]);
       await stream.close();
       await new Promise<void>((resolve) => {
         http.close(() => resolve());

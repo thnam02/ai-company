@@ -166,7 +166,7 @@ describe('agent runtime: the test team, end to end with scripted models', () => 
     // Zara's context pack: her task, Kai's result, nothing of Kai's conversation.
     const zaraFirst = text(t.models.zara, 0);
     assert.match(zaraFirst, /Draft the launch email/);
-    assert.match(zaraFirst, /Write the product brief: Done Files: brief.md/);
+    assert.match(zaraFirst, /Write the product brief \(files: brief\.md\):\n<<<([0-9a-f]{16}) summary\nDone\n\1>>>/, "Kai's summary is fenced as data");
     assert.doesNotMatch(zaraFirst, /AI agents work at desks/);
     // email.send is never a callable tool: only a final action for approval.
     const offered = t.models.zara.requests[0].tools!.map((d) => d.name);
@@ -341,6 +341,100 @@ describe('agent port and the final-action executor', () => {
     assert.deepEqual(t.engine.pendingActions(), []);
     await t.server.recoverActions();
     assert.equal(t.types().filter((x) => x.startsWith('action.')).length, 2, 'recovery is idempotent');
+  });
+});
+
+describe('agent runtime: safety holes found in review', () => {
+  test('a worker that calls email.send directly is refused, and nothing reaches the outbox', async () => {
+    const t = await team({
+      zara: [
+        call('email_send', EMAIL),
+        call('email.send', EMAIL),
+        call('files_write', { path: 'outbox/fake.eml', content: 'To: everyone' }),
+        call('files_write', { path: 'OUTBOX/fake.eml', content: 'To: everyone' }),
+        call('report_blocked', { reason: 'cannot send' }),
+      ],
+    });
+    const goal = must(t.engine.createGoal(GOAL, 100_000));
+    must(t.engine.submitPlan(goal.id, 'ava', [{ ...PLAN[1], dependsOn: [] }]));
+    await t.runtime.runUntilIdle();
+    const denied = t.engine.store.all().filter((e) => e.type === 'tool.denied').map((e) => e.data!.tool);
+    assert.deepEqual(denied, ['email_send', 'email.send']);
+    assert.match(text(t.models.zara, 2), /propose it as the task's finalAction/);
+    assert.match(text(t.models.zara, 4), /outbox/i);
+    assert.equal(existsSync(join(t.dir, 'workspace', 'outbox')), false);
+    assert.equal(existsSync(join(t.dir, 'workspace', 'OUTBOX')), false);
+    assert.equal(t.types().filter((x) => x.startsWith('action.')).length, 0);
+  });
+
+  test('a reviewer that never gives a usable verdict does not loop: the goal budget ends it', async () => {
+    const useless: ScriptedTurn = { text: JSON.stringify({ passed: false, score: 0, feedback: '' }) };
+    const t = await team({ kai: [submit(BRIEF_CRITERIA)], rex: Array(9).fill(useless) });
+    const goal = must(t.engine.createGoal(GOAL, 1_000));
+    const [task] = must(t.engine.submitPlan(goal.id, 'ava', [{ ...PLAN[0], costEstimateTokens: 500 }]));
+    await t.runtime.runUntilIdle();
+    assert.equal(t.engine.getTask(task.id)!.state, 'review');
+    assert.equal(t.models.rex.remaining, 6, 'three attempts, then the runtime moves on instead of looping');
+    for (let i = 0; i < 5 && t.engine.getTask(task.id)!.state === 'review'; i++) await t.runtime.runUntilIdle();
+    assert.equal(t.engine.getTask(task.id)!.state, 'escalated');
+    assert.equal(t.engine.getTask(task.id)!.escalationReason, 'goal budget exhausted');
+    assert.ok(t.engine.getGoal(goal.id)!.spentTokens >= 1_000);
+  });
+
+  test('the kill switch during a review: the verdict is refused and nothing is released until resume', async () => {
+    const final = { tool: 'files.write', input: { path: 'final.md', content: 'shipped' } };
+    const t = await team({
+      kai: [submit(BRIEF_CRITERIA, { finalAction: final })],
+      rex: [
+        (() => {
+          t.engine.pauseCompany('CEO pressed stop');
+          return verdict(true);
+        }) as ScriptedTurn,
+        verdict(true),
+      ],
+    });
+    const goal = must(t.engine.createGoal(GOAL, 100_000));
+    const [task] = must(t.engine.submitPlan(goal.id, 'ava', [PLAN[0]]));
+    await t.runtime.runUntilIdle();
+    assert.equal(t.engine.getTask(task.id)!.state, 'review');
+    assert.equal(t.models.rex.remaining, 1, 'Rex stopped at the pause instead of retrying');
+    assert.equal(existsSync(join(t.dir, 'workspace', 'final.md')), false);
+    assert.deepEqual(t.engine.pendingActions(), []);
+
+    must(t.engine.resumeCompany());
+    await t.runtime.runUntilIdle();
+    assert.equal(t.engine.getTask(task.id)!.state, 'done');
+    await until(() => t.engine.getTask(task.id)!.actionResult !== null);
+    assert.equal(readFileSync(join(t.dir, 'workspace', 'final.md'), 'utf8'), 'shipped');
+  });
+
+  test('closing the server waits for a running final action to record its result', async () => {
+    let finish!: () => void;
+    const t = await team(
+      {},
+      {
+        config: (c) => {
+          c.tools.push({ name: 'slow.send', tier: 3 });
+          c.agents.find((a: any) => a.id === 'zara').tools.push('slow.send');
+        },
+        extraTools: [{ name: 'slow.send', description: '', parameters: {}, dedupesByKey: false, run: () => new Promise((r) => (finish = () => r('sent'))) }],
+      },
+    );
+    const [task] = must(t.engine.submitPlan(must(t.engine.createGoal('g', 100_000)).id, 'ava', [{ ...PLAN[1], dependsOn: [], requiredTools: ['slow.send'] }]));
+    must(t.engine.start(task.id, 'zara'));
+    must(t.engine.submitForReview(task.id, 'zara', { summary: 's', selfCheck: EMAIL_CRITERIA.map((criterion) => ({ criterion, met: true })), finalAction: { tool: 'slow.send', input: {}, idempotencyKey: 'slow-1' } }));
+    must(t.engine.recordReview(task.id, 'rex', { passed: true, score: 1, feedback: '' }));
+    assert.deepEqual((await t.call('POST', `/tasks/${task.id}/approval`, { approved: true })).body, { state: 'done' });
+    let closed = false;
+    const closing = t.server.close().then(() => (closed = true));
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(closed, false, 'close waits while the action runs');
+    finish();
+    await closing;
+    assert.deepEqual(t.engine.getTask(task.id)!.actionResult, { ok: true, detail: 'sent' });
+    assert.equal(t.logs.some((l) => l.startsWith('FATAL')), false);
+    teams = teams.filter((x) => x !== t);
+    rmSync(t.dir, { recursive: true, force: true });
   });
 });
 

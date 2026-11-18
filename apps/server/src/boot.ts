@@ -1,4 +1,4 @@
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkflowEngine } from '@ai-company/core';
 import {
@@ -62,19 +62,35 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): BootConfig 
   const store: StoreConfig = env.DATABASE_URL
     ? { kind: 'postgres', databaseUrl: env.DATABASE_URL, schema: env.DB_SCHEMA || 'public' }
     : { kind: 'sqlite', path: join(dataDir, 'company.db') };
+  const workspaceDir = resolve(env.WORKSPACE_DIR || DEFAULT_WORKSPACE_DIR);
+  const companyConfigPath = resolve(env.COMPANY_CONFIG || DEFAULT_COMPANY_CONFIG);
+  // Agents' file tools reach everything under the workspace: it must not hold
+  // the event log, the checkpoints or the CEO's config (invariant 10).
+  if (contains(workspaceDir, dataDir) || contains(dataDir, workspaceDir)) {
+    throw new Error(`WORKSPACE_DIR (${workspaceDir}) and DATA_DIR (${dataDir}) must not contain each other`);
+  }
+  if (contains(workspaceDir, companyConfigPath)) {
+    throw new Error(`WORKSPACE_DIR (${workspaceDir}) must not contain the company config (${companyConfigPath})`);
+  }
   return {
     store,
     dataDir,
     agents: {
       enabled: env.AGENTS === 'on',
-      workspaceDir: resolve(env.WORKSPACE_DIR || DEFAULT_WORKSPACE_DIR),
+      workspaceDir,
       ollamaUrl: env.OLLAMA_URL || 'http://127.0.0.1:11434',
     },
     ceoToken,
     host: env.HOST || '127.0.0.1',
     port,
-    companyConfigPath: env.COMPANY_CONFIG || DEFAULT_COMPANY_CONFIG,
+    companyConfigPath,
   };
+}
+
+/** True when `path` is `dir` or inside it. */
+function contains(dir: string, path: string): boolean {
+  const rel = relative(dir, path);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 export interface RunningServer {
