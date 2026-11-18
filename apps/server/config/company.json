@@ -1,0 +1,35 @@
+{
+  "tools": [
+    { "name": "repo.read", "tier": 0, "description": "Read files in the company repo" },
+    { "name": "github.create_branch", "tier": 1, "description": "Create a branch in the company repo" },
+    { "name": "github.open_pr", "tier": 1, "description": "Open a pull request in the company repo" },
+    { "name": "staging.deploy", "tier": 2, "description": "Deploy to staging" },
+    { "name": "prod.deploy", "tier": 3, "description": "Deploy to production" },
+    { "name": "web.search", "tier": 0, "description": "Search the web" },
+    { "name": "kb.read", "tier": 0, "description": "Read the company knowledge base" },
+    { "name": "docs.write", "tier": 1, "description": "Draft or edit an internal doc" },
+    { "name": "social.schedule_post", "tier": 2, "description": "Schedule a social post (can be unscheduled)" },
+    { "name": "cms.publish", "tier": 3, "description": "Publish content on the public website" },
+    { "name": "ads.update_budget", "tier": 3, "description": "Change ad spend" },
+    { "name": "crm.read", "tier": 0, "description": "Read CRM records" },
+    { "name": "crm.update", "tier": 1, "description": "Update CRM records" },
+    { "name": "email.send", "tier": 3, "description": "Send an email outside the company" },
+    { "name": "helpdesk.read", "tier": 0, "description": "Read support tickets" },
+    { "name": "helpdesk.reply", "tier": 3, "description": "Reply to a customer ticket" }
+  ],
+  "autoApproveTier2": [],
+  "limits": {},
+  "agents": [
+    { "id": "ava", "name": "Ava", "kind": "orchestrator", "role": "chief-of-staff", "model": "claude-opus-5-5", "tools": [] },
+    { "id": "kai", "name": "Kai", "kind": "worker", "role": "backend-engineer", "model": "claude-sonnet-5-5", "tools": ["repo.read", "github.create_branch", "github.open_pr", "staging.deploy", "prod.deploy"] },
+    { "id": "mina", "name": "Mina", "kind": "worker", "role": "frontend-engineer", "model": "claude-sonnet-5-5", "tools": ["repo.read", "github.create_branch", "github.open_pr", "staging.deploy"] },
+    { "id": "leo", "name": "Leo", "kind": "worker", "role": "qa-engineer", "model": "claude-haiku-5-5", "tools": ["repo.read", "github.create_branch", "github.open_pr"] },
+    { "id": "zara", "name": "Zara", "kind": "worker", "role": "content-writer", "model": "claude-sonnet-5-5", "tools": ["web.search", "kb.read", "docs.write", "cms.publish"] },
+    { "id": "theo", "name": "Theo", "kind": "worker", "role": "growth-marketer", "model": "claude-sonnet-5-5", "tools": ["web.search", "docs.write", "social.schedule_post", "ads.update_budget"] },
+    { "id": "ivy", "name": "Ivy", "kind": "worker", "role": "sales-development-rep", "model": "claude-haiku-5-5", "tools": ["crm.read", "crm.update", "email.send"] },
+    { "id": "omar", "name": "Omar", "kind": "worker", "role": "account-executive", "model": "claude-sonnet-5-5", "tools": ["crm.read", "crm.update", "docs.write", "email.send"] },
+    { "id": "nora", "name": "Nora", "kind": "worker", "role": "support-lead", "model": "claude-haiku-5-5", "tools": ["helpdesk.read", "kb.read", "helpdesk.reply"] },
+    { "id": "atlas", "name": "Atlas", "kind": "worker", "role": "research-librarian", "model": "claude-sonnet-5-5", "tools": ["web.search", "kb.read", "docs.write"] },
+    { "id": "rex", "name": "Rex", "kind": "reviewer", "role": "reviewer", "model": "claude-opus-5-5", "tools": [] }
+  ]
+}
