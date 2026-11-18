@@ -1,6 +1,6 @@
 import pg from 'pg';
-import type { EngineEvent, EventListener, NewEvent } from '@ai-company/core';
-import type { DurableEventStore } from './durable-store.ts';
+import type { EngineEvent } from '@ai-company/core';
+import { BufferedEventStore } from './buffered-store.ts';
 
 export interface PostgresStoreOptions {
   connectionString: string;
@@ -26,23 +26,15 @@ const INSERT_CHUNK = 1000;
  * - A failed write poisons the store: memory is now ahead of the database,
  *   so the only safe move is to restart and rebuild from the log.
  */
-export class PostgresEventStore implements DurableEventStore {
+export class PostgresEventStore extends BufferedEventStore {
   private readonly client: pg.Client;
   private readonly table: string;
-  private readonly events: EngineEvent[];
-  private readonly listeners = new Set<EventListener>();
-  private pending: EngineEvent[] = [];
-  private durable: number;
   private chain: Promise<void> = Promise.resolve();
-  private failure: Error | null = null;
-  private readonly failureListeners: ((err: Error) => void)[] = [];
-  private closed = false;
 
   private constructor(client: pg.Client, table: string, events: EngineEvent[]) {
+    super(events);
     this.client = client;
     this.table = table;
-    this.events = events;
-    this.durable = events.length;
     // A dropped connection also drops the single-writer lock, so this store
     // must never write again. Poison it; the next flush reports the failure
     // and the server goes fatal (instead of an unhandled 'error' crash).
@@ -62,67 +54,12 @@ export class PostgresEventStore implements DurableEventStore {
       await migrate(client, schema);
       const table = `${schema}.events`;
       const { rows } = await client.query(`SELECT seq, at, type, goal_id, task_id, agent_id, data FROM ${table} ORDER BY seq`);
-      const events = rows.map(fromRow);
-      events.forEach((e, i) => {
-        if (e.seq !== i + 1) throw new Error(`gap in event log: expected seq ${i + 1}, found ${e.seq}`);
-      });
-      const store = new PostgresEventStore(client, table, events);
+      const store = new PostgresEventStore(client, table, rows.map(fromRow));
       client.off('error', early);
       return store;
     } catch (err) {
       await client.end().catch(() => {});
       throw err;
-    }
-  }
-
-  get size(): number {
-    return this.events.length;
-  }
-
-  get durableSeq(): number {
-    return this.durable;
-  }
-
-  append(event: NewEvent): EngineEvent {
-    if (this.failure) throw new Error(`event store failed: ${this.failure.message}`);
-    if (this.closed) throw new Error('event store is closed');
-    const stored: EngineEvent = Object.freeze({ ...event, seq: this.events.length + 1 });
-    this.events.push(stored);
-    this.pending.push(stored);
-    return stored;
-  }
-
-  all(): readonly EngineEvent[] {
-    return this.events;
-  }
-
-  since(seq: number): EngineEvent[] {
-    return this.events.slice(Math.max(0, Math.floor(seq)));
-  }
-
-  subscribe(listener: EventListener): () => void {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
-  }
-
-  abort(err: Error): void {
-    this.pending = [];
-    this.fail(err);
-  }
-
-  onFailure(listener: (err: Error) => void): void {
-    this.failureListeners.push(listener);
-  }
-
-  private fail(err: Error): void {
-    if (this.failure) return;
-    this.failure = err;
-    for (const listener of this.failureListeners) {
-      try {
-        listener(err);
-      } catch {
-        // Listeners must not break failure handling.
-      }
     }
   }
 
@@ -144,10 +81,9 @@ export class PostgresEventStore implements DurableEventStore {
   }
 
   private async writePending(): Promise<void> {
-    if (this.failure) throw new Error(`event store failed: ${this.failure.message}`);
-    if (this.pending.length === 0) return;
-    const batch = this.pending;
-    this.pending = [];
+    this.assertWritable();
+    const batch = this.takePending();
+    if (batch.length === 0) return;
     try {
       await this.client.query('BEGIN');
       for (let i = 0; i < batch.length; i += INSERT_CHUNK) {
@@ -155,20 +91,11 @@ export class PostgresEventStore implements DurableEventStore {
       }
       await this.client.query('COMMIT');
     } catch (err) {
-      this.fail(err instanceof Error ? err : new Error(String(err)));
+      const failure = this.fail(err);
       await this.client.query('ROLLBACK').catch(() => {});
-      throw this.failure;
+      throw failure;
     }
-    this.durable = batch[batch.length - 1].seq;
-    for (const event of batch) {
-      for (const listener of this.listeners) {
-        try {
-          listener(event);
-        } catch {
-          // A broken subscriber must never break the write path.
-        }
-      }
-    }
+    this.committed(batch);
   }
 
   private async insert(rows: EngineEvent[]): Promise<void> {
