@@ -10,3 +10,6 @@ coverage/
 
 # Local event log (SQLite) and other runtime data
 data/
+
+# Agents' workspace (notes, drafts, outbox)
+workspace/

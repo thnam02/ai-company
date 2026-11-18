@@ -77,9 +77,9 @@ for (const backend of backends) {
 
     async function startServer(): Promise<Child> {
       // Only this test's log: a SQLite run must never inherit DATABASE_URL.
-      const { DATABASE_URL: _url, DB_SCHEMA: _schema, DATA_DIR: _data, ...inherited } = process.env;
+      const { DATABASE_URL: _url, DB_SCHEMA: _schema, DATA_DIR: _data, WORKSPACE_DIR: _ws, AGENTS: _agents, ...inherited } = process.env;
       const proc = spawn(process.execPath, [MAIN], {
-        env: { ...inherited, ...log.env, CEO_TOKEN: TOKEN, PORT: '0', COMPANY_CONFIG: configPath },
+        env: { ...inherited, ...log.env, CEO_TOKEN: TOKEN, PORT: '0', COMPANY_CONFIG: configPath, WORKSPACE_DIR: join(dir, 'workspace'), AGENTS: 'off' },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let stderr = '';

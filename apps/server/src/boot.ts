@@ -1,18 +1,41 @@
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { WorkflowEngine, type ProposedAction } from '@ai-company/core';
+import { WorkflowEngine } from '@ai-company/core';
+import {
+  AgentRuntime,
+  OllamaProvider,
+  ToolRegistry,
+  Workspace,
+  parseModelRef,
+  workspaceTools,
+  type AgentModel,
+  type AgentView,
+  type ModelProvider,
+} from '@ai-company/agents';
 import { createCompanyServer, type CompanyServer } from './app.ts';
 import { bootstrapAgents, buildPolicy, loadCompanyConfig } from './company.ts';
 import type { DurableEventStore } from './durable-store.ts';
 import { PostgresEventStore } from './pg-event-store.ts';
+import { SqliteCheckpointStore } from './sqlite-checkpoint-store.ts';
 import { SqliteEventStore } from './sqlite-event-store.ts';
 import { startStuckTimer } from './stuck-timer.ts';
 
 /** Where the event log lives: a local SQLite file by default, Postgres when DATABASE_URL is set. */
 export type StoreConfig = { kind: 'sqlite'; path: string } | { kind: 'postgres'; databaseUrl: string; schema: string };
 
+export interface AgentsConfig {
+  /** AGENTS=on. Off by default until the live run is proven (M3b). */
+  enabled: boolean;
+  /** The only folder agents' file tools can reach. */
+  workspaceDir: string;
+  ollamaUrl: string;
+}
+
 export interface BootConfig {
   store: StoreConfig;
+  /** Local data: the SQLite event log (unless Postgres) and agent checkpoints. */
+  dataDir: string;
+  agents: AgentsConfig;
   ceoToken: string;
   host: string;
   port: number;
@@ -21,11 +44,12 @@ export interface BootConfig {
 
 export const DEFAULT_COMPANY_CONFIG = fileURLToPath(new URL('../config/company.json', import.meta.url));
 /**
- * `<repo>/data`, whatever directory the server is started from, so every way
- * of starting it finds the same company. A relative DATA_DIR resolves against
- * the working directory as usual.
+ * `<repo>/data` and `<repo>/workspace`, whatever directory the server is
+ * started from, so every way of starting it finds the same company. Relative
+ * DATA_DIR and WORKSPACE_DIR values resolve against the working directory.
  */
 export const DEFAULT_DATA_DIR = fileURLToPath(new URL('../../../data', import.meta.url));
+export const DEFAULT_WORKSPACE_DIR = fileURLToPath(new URL('../../../workspace', import.meta.url));
 
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): BootConfig {
   const ceoToken = env.CEO_TOKEN;
@@ -33,11 +57,19 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): BootConfig 
   if (ceoToken.length < 16) throw new Error('CEO_TOKEN must be at least 16 characters');
   const port = Number(env.PORT ?? 4100);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('PORT must be a port number');
+  if (env.AGENTS !== undefined && env.AGENTS !== 'on' && env.AGENTS !== 'off') throw new Error('AGENTS must be "on" or "off"');
+  const dataDir = resolve(env.DATA_DIR || DEFAULT_DATA_DIR);
   const store: StoreConfig = env.DATABASE_URL
     ? { kind: 'postgres', databaseUrl: env.DATABASE_URL, schema: env.DB_SCHEMA || 'public' }
-    : { kind: 'sqlite', path: resolve(env.DATA_DIR || DEFAULT_DATA_DIR, 'company.db') };
+    : { kind: 'sqlite', path: join(dataDir, 'company.db') };
   return {
     store,
+    dataDir,
+    agents: {
+      enabled: env.AGENTS === 'on',
+      workspaceDir: resolve(env.WORKSPACE_DIR || DEFAULT_WORKSPACE_DIR),
+      ollamaUrl: env.OLLAMA_URL || 'http://127.0.0.1:11434',
+    },
     ceoToken,
     host: env.HOST || '127.0.0.1',
     port,
@@ -56,6 +88,12 @@ export interface RunningServer {
   stop(): Promise<void>;
 }
 
+export interface BootHooks {
+  onFatal?: (err: Error) => void;
+  /** Overrides how agents find their model (tests use scripted models). */
+  modelFor?: (agent: AgentView) => AgentModel | undefined;
+}
+
 export async function openStore(config: StoreConfig): Promise<DurableEventStore> {
   return config.kind === 'sqlite'
     ? SqliteEventStore.open({ path: config.path })
@@ -64,11 +102,12 @@ export async function openStore(config: StoreConfig): Promise<DurableEventStore>
 
 /**
  * Boot sequence: load config → take the event-log lock → replay every event
- * into a fresh engine → register any new agents → start the stuck timer →
- * listen. State comes only from the log, so a restart after a crash ends up
- * exactly where the last durable event left it.
+ * into a fresh engine → bring the roster in line with the config → finish or
+ * give up on final actions interrupted by a crash → start the stuck timer →
+ * listen → start the agents (if enabled). State comes only from the log, so a
+ * restart after a crash ends up exactly where the last durable event left it.
  */
-export async function boot(config: BootConfig, hooks: { onExecute?: (action: ProposedAction, ctx: { taskId: string }) => void; onFatal?: (err: Error) => void } = {}): Promise<RunningServer> {
+export async function boot(config: BootConfig, hooks: BootHooks = {}): Promise<RunningServer> {
   const log = (m: string) => console.error(`[server] ${m}`);
   const company = loadCompanyConfig(config.companyConfigPath);
   const store = await openStore(config.store);
@@ -78,16 +117,22 @@ export async function boot(config: BootConfig, hooks: { onExecute?: (action: Pro
 
   let server: CompanyServer | undefined;
   let stopTimer: (() => void) | undefined;
+  let checkpoints: SqliteCheckpointStore | undefined;
+  let runtime: AgentRuntime | undefined;
   try {
     const engine = new WorkflowEngine({ policy: buildPolicy(company), store, limits: company.limits });
     log(`replayed ${store.size} events`);
+
+    // Executors for released final actions, needed even with agents off (a CEO approval releases one).
+    const workspace = new Workspace(config.agents.workspaceDir);
+    const tools = new ToolRegistry(workspaceTools(workspace));
 
     server = createCompanyServer({
       engine,
       store,
       ceoToken: config.ceoToken,
+      tools,
       log,
-      onExecute: hooks.onExecute,
       onFatal: hooks.onFatal ?? (() => process.exit(1)),
     });
     const { run, http } = server;
@@ -103,6 +148,8 @@ export async function boot(config: BootConfig, hooks: { onExecute?: (action: Pro
     if (report.updated.length) log(`updated agents from config: ${report.updated.join(', ')}`);
     if (report.retired.length) log(`retired agents (not in config; tools revoked, paused): ${report.retired.join(', ')}`);
 
+    await server.recoverActions();
+
     stopTimer = startStuckTimer({ run, engine, log });
     await new Promise<void>((resolve, reject) => {
       http.once('error', reject);
@@ -111,21 +158,44 @@ export async function boot(config: BootConfig, hooks: { onExecute?: (action: Pro
     const address = http.address();
     const port = typeof address === 'object' && address ? address.port : config.port;
 
+    if (config.agents.enabled) {
+      checkpoints = SqliteCheckpointStore.open({ path: join(config.dataDir, 'agents.db') });
+      const providers: Record<string, ModelProvider> = { ollama: new OllamaProvider({ baseUrl: config.agents.ollamaUrl }) };
+      const modelFor =
+        hooks.modelFor ??
+        ((agent: AgentView): AgentModel | undefined => {
+          const ref = parseModelRef(agent.model);
+          const provider = ref && providers[ref.provider];
+          return provider ? { provider, model: ref.model, options: company.modelOptions[agent.id] } : undefined;
+        });
+      runtime = new AgentRuntime({ port: server.agentPort, modelFor, tools, workspace, checkpoints, log: (m) => console.error(`[agents] ${m}`) });
+      runtime.start();
+      log(`agents on; workspace ${workspace.root}`);
+    } else {
+      log('agents off (set AGENTS=on to start them)');
+    }
+
     const running = server;
     const stopTicks = stopTimer;
+    const agents = runtime;
+    const memory = checkpoints;
     return {
       server: running,
       url: `http://${config.host}:${port}`,
       async stop() {
+        await agents?.stop();
         stopTicks();
         await running.close();
+        memory?.close();
         await store.close({ flush: !running.failed });
       },
     };
   } catch (err) {
     // Release the log (and its lock) so a retry in this process can open it.
+    await runtime?.stop().catch(() => {});
     stopTimer?.();
     await server?.close().catch(() => {});
+    checkpoints?.close();
     await store.close({ flush: false }).catch(() => {});
     throw err;
   }

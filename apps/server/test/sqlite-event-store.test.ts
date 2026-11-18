@@ -188,7 +188,8 @@ describe('SqliteEventStore', () => {
     const blocker = createServer().listen(0, '127.0.0.1');
     await once(blocker, 'listening');
     const port = (blocker.address() as AddressInfo).port;
-    const config = { store: { kind: 'sqlite' as const, path }, ceoToken: 'x'.repeat(16), host: '127.0.0.1', port, companyConfigPath: configPath };
+    const agents = { enabled: false, workspaceDir: join(dir, 'workspace'), ollamaUrl: 'http://127.0.0.1:11434' };
+    const config = { store: { kind: 'sqlite' as const, path }, dataDir: dirname(path), agents, ceoToken: 'x'.repeat(16), host: '127.0.0.1', port, companyConfigPath: configPath };
     await assert.rejects(boot(config, { onFatal: () => {} }), /EADDRINUSE/);
     blocker.close();
     const running = await boot({ ...config, port: 0 }, { onFatal: () => {} });
