@@ -6,7 +6,7 @@ export type EventListener = (event: EngineEvent) => void;
  * Append-only event store. Current state is always rebuilt from these events,
  * so the store is the single source of truth (and what the 3D office streams).
  *
- * Milestone 2 adds a Postgres implementation of this same interface.
+ * apps/server adds a Postgres implementation (`PostgresEventStore`, a `DurableEventStore`).
  */
 export interface EventStore {
   append(event: NewEvent): EngineEvent;

@@ -124,6 +124,10 @@ export class WorkflowEngine {
     return g && { ...g };
   }
 
+  listGoals(): Goal[] {
+    return [...this.goals.values()].map((g) => ({ ...g }));
+  }
+
   getAgent(id: string): AgentProfile | undefined {
     const a = this.agents.get(id);
     return a && structuredClone(a);
@@ -147,6 +151,32 @@ export class WorkflowEngine {
     const agent: AgentProfile = { ...input, tools: [...input.tools], paused: false, benched: false };
     this.emit('agent.registered', { agentId: agent.id, data: { agent } });
     return ok(structuredClone(agent));
+  }
+
+  /**
+   * CEO config change to a live agent (name, role, model, tool allowlist).
+   * The kind cannot change. Revoked tools are denied from the next call on.
+   * CEO/boot only, like registerAgent and unbenchAgent: it can grant tools,
+   * so agent loops must never be given access to it.
+   */
+  updateAgent(agentId: string, changes: Partial<Pick<AgentProfile, 'name' | 'role' | 'model' | 'tools'>>): Result<AgentProfile> {
+    const a = this.agents.get(agentId);
+    if (!a) return fail(`unknown agent "${agentId}"`);
+    const next = {
+      name: changes.name ?? a.name,
+      role: changes.role ?? a.role,
+      model: changes.model ?? a.model,
+      tools: [...(changes.tools ?? a.tools)],
+    };
+    if (!next.name) return fail('agent needs a name');
+    const unknown = next.tools.filter((t) => !this.policy.hasTool(t));
+    if (unknown.length) return fail(`unknown tools: ${unknown.join(', ')}`);
+    if (a.kind !== 'worker' && next.tools.length) return fail(`only workers may have tools; ${a.name} is a ${a.kind}`);
+    const same =
+      next.name === a.name && next.role === a.role && next.model === a.model &&
+      next.tools.length === a.tools.length && next.tools.every((t, i) => t === a.tools[i]);
+    if (!same) this.emit('agent.updated', { agentId, data: { profile: next } });
+    return ok(structuredClone(this.agents.get(agentId)!));
   }
 
   pauseAgent(agentId: string): Result<true> {
@@ -499,6 +529,14 @@ export class WorkflowEngine {
       case 'agent.registered':
         this.agents.set(d.agent.id, structuredClone(d.agent));
         break;
+      case 'agent.updated': {
+        const a = this.agents.get(e.agentId!)!;
+        a.name = d.profile.name;
+        a.role = d.profile.role;
+        a.model = d.profile.model;
+        a.tools = [...d.profile.tools];
+        break;
+      }
       case 'agent.paused':
         this.agents.get(e.agentId!)!.paused = true;
         break;

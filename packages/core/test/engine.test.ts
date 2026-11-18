@@ -242,6 +242,39 @@ describe('event sourcing', () => {
     must(rebuilt.decideApproval(t.id, { approved: true }));
   });
 
+  test('updateAgent changes a live agent through an event that replays', () => {
+    const { engine, options } = makeCompany();
+    const { task: t } = startedTask(engine);
+    must(engine.updateAgent('kai', { model: 'haiku', tools: ['github.create_branch'] }));
+    assert.equal(engine.getAgent('kai')!.model, 'haiku');
+    // A revoked tool is denied from the next call on, even mid-task.
+    assert.equal(engine.requestToolCall(t.id, 'kai', { tool: 'repo.read', input: {}, idempotencyKey: 'k1' }).ok, false);
+
+    const rebuilt = WorkflowEngine.fromEvents(engine.store.all(), { policy: options.policy, now: options.now });
+    assert.deepEqual(rebuilt.listAgents(), engine.listAgents());
+    assert.equal(engine.store.all().at(-2)!.type, 'agent.updated');
+  });
+
+  test('updateAgent refuses unknown agents, unknown tools, tools for non-workers and no-op changes', () => {
+    const { engine } = makeCompany();
+    assert.match((engine.updateAgent('nobody', { model: 'x' }) as any).error, /unknown agent/);
+    assert.match((engine.updateAgent('kai', { tools: ['laser'] }) as any).error, /unknown tools/);
+    assert.match((engine.updateAgent('rex', { tools: ['repo.read'] }) as any).error, /only workers/);
+    const before = engine.store.size;
+    must(engine.updateAgent('kai', { model: 'sonnet' }));
+    assert.equal(engine.store.size, before, 'no event when nothing changes');
+  });
+
+  test('listGoals returns copies of every goal, including goals without tasks', () => {
+    const { engine } = makeCompany();
+    const a = must(engine.createGoal('First', 1_000));
+    const b = must(engine.createGoal('Second', 2_000));
+    const goals = engine.listGoals();
+    assert.deepEqual(goals.map((g) => g.id), [a.id, b.id]);
+    goals[0].spentTokens = 999;
+    assert.equal(engine.getGoal(a.id)!.spentTokens, 0);
+  });
+
   test('subscribers see every event as it is appended', () => {
     const { engine } = makeCompany();
     const seen: string[] = [];
