@@ -401,3 +401,110 @@ describe('artifacts and the final-action execution record', () => {
     assert.deepEqual(engine.pendingActions(), []);
   });
 });
+
+describe('agent runtime safety: kill switch, budgets and usage', () => {
+  test('while the company is paused no review is recorded and no plan is accepted, so nothing is released', () => {
+    const { engine } = makeCompany();
+    const { task: t } = startedTask(engine, { requiredTools: ['repo.read'] });
+    const action = { tool: 'github.create_branch', input: { name: 'x' }, idempotencyKey: 'branch-1' };
+    must(engine.submitForReview(t.id, 'kai', { summary: 'Done', selfCheck: allMet(t.acceptanceCriteria), finalAction: action }));
+    must(engine.pauseCompany('stop'));
+    assert.match((engine.recordReview(t.id, 'rex', { passed: true, score: 1, feedback: '' }) as any).error, /company is paused/);
+    assert.equal(engine.getTask(t.id)!.state, 'review');
+    assert.deepEqual(engine.pendingActions(), []);
+    const other = must(engine.createGoal('Another', 50_000));
+    assert.match((engine.submitPlan(other.id, 'ava', [task()]) as any).error, /company is paused/);
+    must(engine.resumeCompany());
+    const outcome = must(engine.recordReview(t.id, 'rex', { passed: true, score: 1, feedback: '' }));
+    assert.deepEqual(outcome.execute, action);
+  });
+
+  test('a paused or benched orchestrator cannot get a plan accepted', () => {
+    const { engine } = makeCompany();
+    const goal = must(engine.createGoal('Plan me', 50_000));
+    must(engine.pauseAgent('ava'));
+    assert.match((engine.submitPlan(goal.id, 'ava', [task()]) as any).error, /Ava is paused/);
+    must(engine.resumeAgent('ava'));
+    must(engine.submitPlan(goal.id, 'ava', [task()]));
+  });
+
+  test('an exhausted goal budget also escalates a task waiting in review', () => {
+    const { engine } = makeCompany();
+    const { goal, task: t } = startedTask(engine, {}, 20_000);
+    must(engine.submitForReview(t.id, 'kai', { summary: 'Done', selfCheck: allMet(t.acceptanceCriteria) }));
+    must(engine.recordGoalStep(goal.id, 'rex', 25_000));
+    assert.equal(engine.getTask(t.id)!.state, 'escalated');
+    assert.equal(engine.getTask(t.id)!.escalationReason, 'goal budget exhausted');
+  });
+
+  test('tokens of a turn that ends after the task left working are still charged', () => {
+    const { engine, options } = makeCompany();
+    const { goal, task: t } = startedTask(engine);
+    must(engine.recordStep(t.id, 'kai', 1_000));
+    must(engine.escalate(t.id, 'CEO stopped it'));
+    assert.match((engine.recordStep(t.id, 'kai', 4_000) as any).error, /task is escalated, not working/);
+    assert.equal(engine.getTask(t.id)!.tokens, 5_000);
+    assert.equal(engine.getTask(t.id)!.steps, 1, 'usage after the task stopped is not a step');
+    assert.equal(engine.getGoal(goal.id)!.spentTokens, 5_000);
+    assert.equal(engine.store.all().at(-1)!.type, 'task.usage');
+    assert.match((engine.recordStep(t.id, 'omar', 1) as any).error, /owner/);
+    assert.equal(engine.store.all().at(-1)!.type, 'task.usage', 'only the owner can charge usage');
+    const rebuilt = WorkflowEngine.fromEvents(engine.store.all(), { policy: options.policy, now: options.now });
+    assert.deepEqual(rebuilt.getTask(t.id), engine.getTask(t.id));
+    assert.deepEqual(rebuilt.getGoal(goal.id), engine.getGoal(goal.id));
+  });
+
+  test('the stuck timer ignores work stopped by a pause, and resuming restarts the clock', () => {
+    const { engine, advance } = makeCompany();
+    const { task: t } = startedTask(engine);
+    must(engine.pauseCompany('lunch'));
+    advance(10 * 60_000);
+    assert.deepEqual(engine.checkStuck(), []);
+    must(engine.resumeCompany());
+    assert.deepEqual(engine.checkStuck(), [], 'resuming gives the task a fresh activity time');
+    must(engine.pauseAgent('kai'));
+    advance(10 * 60_000);
+    assert.deepEqual(engine.checkStuck(), []);
+    must(engine.resumeAgent('kai'));
+    assert.deepEqual(engine.checkStuck(), []);
+    advance(6 * 60_000);
+    assert.deepEqual(engine.checkStuck(), [t.id]);
+  });
+
+  test('an action approved before executions were recorded (an older log) is not run on upgrade', () => {
+    const { engine, options } = makeCompany();
+    const { task: t } = startedTask(engine, { ownerId: 'omar', requiredTools: ['email.send'] });
+    must(engine.submitForReview(t.id, 'omar', { summary: 'Drafted', selfCheck: allMet(t.acceptanceCriteria), finalAction: { tool: 'email.send', input: {}, idempotencyKey: 'old-mail' } }));
+    must(engine.recordReview(t.id, 'rex', { passed: true, score: 1, feedback: '' }));
+    must(engine.decideApproval(t.id, { approved: true }));
+    assert.equal(engine.pendingActions().length, 1);
+    // An M2 log: no artifacts, no actionResult, no release marker.
+    const old = engine.store.all().map((e) => {
+      if (e.type === 'task.done') return { ...e, data: { summary: e.data!.summary } };
+      if (e.type === 'task.submitted') {
+        const { artifacts: _a, ...data } = e.data!;
+        return { ...e, data };
+      }
+      if (e.type === 'plan.accepted') {
+        return { ...e, data: { tasks: e.data!.tasks.map(({ artifacts: _a, actionResult: _r, ...rest }: any) => rest) } };
+      }
+      return e;
+    });
+    const rebuilt = WorkflowEngine.fromEvents(old, { policy: options.policy, now: options.now });
+    assert.deepEqual(rebuilt.pendingActions(), []);
+    assert.deepEqual(rebuilt.getTask(t.id)!.artifacts, []);
+    assert.equal(rebuilt.getTask(t.id)!.actionResult!.ok, false);
+    assert.match(rebuilt.getTask(t.id)!.actionResult!.detail, /not executed/);
+  });
+
+  test('action.failed replays', () => {
+    const { engine, options } = makeCompany();
+    const { task: t } = startedTask(engine);
+    must(engine.submitForReview(t.id, 'kai', { summary: 'Done', selfCheck: allMet(t.acceptanceCriteria), finalAction: { tool: 'github.create_branch', input: {}, idempotencyKey: 'b-1' } }));
+    must(engine.recordReview(t.id, 'rex', { passed: true, score: 1, feedback: '' }));
+    must(engine.recordActionResult(t.id, 'b-1', { ok: false, detail: 'boom' }));
+    const rebuilt = WorkflowEngine.fromEvents(engine.store.all(), { policy: options.policy, now: options.now });
+    assert.deepEqual(rebuilt.getTask(t.id)!.actionResult, { ok: false, detail: 'boom' });
+    assert.deepEqual(rebuilt.pendingActions(), []);
+  });
+});

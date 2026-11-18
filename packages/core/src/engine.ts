@@ -259,6 +259,8 @@ export class WorkflowEngine {
     if (!goal) return fail(`unknown goal "${goalId}"`);
     const orchestrator = this.agents.get(orchestratorId);
     if (!orchestrator || orchestrator.kind !== 'orchestrator') return fail('plans must come from the orchestrator');
+    if (this.companyPaused) return fail('company is paused');
+    if (orchestrator.paused || orchestrator.benched) return fail(`${orchestrator.name} is ${orchestrator.benched ? 'benched' : 'paused'}`);
     if (goal.status !== 'open') return fail(`goal is ${goal.status}, not open`);
 
     const errors = validatePlan(plan, { goal, agents: this.agents, policy: this.policy });
@@ -317,13 +319,24 @@ export class WorkflowEngine {
     return ok(t.state);
   }
 
-  /** Record one agent step (one model turn). Enforces step, token, time and budget limits. */
+  /**
+   * Record one agent step (one model turn). Enforces step, token, time and
+   * budget limits. A turn that finishes after its task left `working` (the
+   * CEO or a limit stopped it mid-call) is still charged, as `task.usage`,
+   * but is not a step and the call fails.
+   */
   recordStep(taskId: string, agentId: string, tokens: number): Result<TaskState> {
     const t = this.tasks.get(taskId);
     if (!t) return fail(`unknown task "${taskId}"`);
-    if (t.state !== 'working') return fail(`task is ${t.state}, not working`);
     if (t.ownerId !== agentId) return fail('only the task owner can record steps');
     if (!Number.isFinite(tokens) || tokens < 0) return fail('tokens must be a non-negative number');
+    if (t.state !== 'working') {
+      if (tokens > 0) {
+        this.emit('task.usage', { goalId: t.goalId, taskId, agentId, data: { tokens } });
+        this.enforceGoalBudget(t.goalId);
+      }
+      return fail(`task is ${t.state}, not working`);
+    }
 
     this.emit('task.step', { goalId: t.goalId, taskId, agentId, data: { tokens } });
 
@@ -444,6 +457,7 @@ export class WorkflowEngine {
   recordReview(taskId: string, reviewerId: string, verdict: ReviewVerdict): Result<Outcome> {
     const t = this.tasks.get(taskId);
     if (!t) return fail(`unknown task "${taskId}"`);
+    if (this.companyPaused) return fail('company is paused');
     if (t.state !== 'review') return fail(`task is ${t.state}, not in review`);
     const reviewer = this.agents.get(reviewerId);
     if (!reviewer || reviewer.kind !== 'reviewer') return fail('reviews must come from a reviewer agent');
@@ -465,7 +479,7 @@ export class WorkflowEngine {
       this.emit('approval.requested', { goalId: t.goalId, taskId, agentId: t.ownerId, data: { action: t.finalAction } });
       return ok({ state: t.state, execute: null });
     }
-    this.emit('task.done', { goalId: t.goalId, taskId, agentId: t.ownerId, data: { summary: t.summary } });
+    this.emit('task.done', { goalId: t.goalId, taskId, agentId: t.ownerId, data: { summary: t.summary, release: !!t.finalAction } });
     return ok({ state: t.state, execute: toAction(t.finalAction) });
   }
 
@@ -478,7 +492,7 @@ export class WorkflowEngine {
 
     if (decision.approved) {
       this.emit('approval.granted', { ...base, data: { note: decision.note ?? '' } });
-      this.emit('task.done', { ...base, data: { summary: t.summary } });
+      this.emit('task.done', { ...base, data: { summary: t.summary, release: !!t.finalAction } });
       return ok({ state: t.state, execute: toAction(t.finalAction) });
     }
     if (!decision.note?.trim()) return fail('a rejection needs a note so the agent can revise');
@@ -548,6 +562,8 @@ export class WorkflowEngine {
     const escalated: string[] = [];
     for (const t of this.tasks.values()) {
       if (t.state !== 'working') continue;
+      // Work stopped by the CEO is not stuck; resuming restarts its clock.
+      if (this.companyPaused || this.agents.get(t.ownerId)?.paused) continue;
       if (t.lastActivityAt !== null && now - t.lastActivityAt > this.limits.stuckAfterMs) {
         this.escalateInternal(t, `no progress for ${Math.round((now - t.lastActivityAt) / 1000)}s`);
         escalated.push(t.id);
@@ -578,12 +594,19 @@ export class WorkflowEngine {
     if (used >= 1) {
       if (goal.status === 'open') this.emit('goal.escalated', { goalId, data: { reason: 'goal budget exhausted' } });
       for (const t of this.tasks.values()) {
-        if (t.goalId === goalId && (t.state === 'working' || t.state === 'assigned' || t.state === 'planned')) {
+        if (t.goalId === goalId && (t.state === 'working' || t.state === 'assigned' || t.state === 'planned' || t.state === 'review')) {
           this.escalateInternal(t, 'goal budget exhausted');
         }
       }
     } else if (used >= this.limits.budgetWarnAt && !goal.warned) {
       this.emit('budget.warning', { goalId, data: { used: Math.round(used * 100) / 100 } });
+    }
+  }
+
+  /** Pausing stops the stuck clock: on resume, working tasks count as active from now. */
+  private restartActivityClock(at: number, ownerId?: string): void {
+    for (const t of this.tasks.values()) {
+      if (t.state === 'working' && (ownerId === undefined || t.ownerId === ownerId)) t.lastActivityAt = at;
     }
   }
 
@@ -623,6 +646,7 @@ export class WorkflowEngine {
         break;
       case 'agent.resumed':
         this.agents.get(e.agentId!)!.paused = false;
+        this.restartActivityClock(e.at, e.agentId);
         break;
       case 'agent.benched':
         this.agents.get(e.agentId!)!.benched = true;
@@ -636,6 +660,7 @@ export class WorkflowEngine {
         break;
       case 'company.resumed':
         this.companyPaused = false;
+        this.restartActivityClock(e.at);
         break;
       case 'goal.created':
         // Older logs have no planning fields.
@@ -693,6 +718,12 @@ export class WorkflowEngine {
         touch();
         break;
       }
+      case 'task.usage': {
+        t!.tokens += d.tokens;
+        const goal = this.goals.get(t!.goalId);
+        if (goal) goal.spentTokens += d.tokens;
+        break;
+      }
       case 'budget.warning':
         this.goals.get(e.goalId!)!.warned = true;
         break;
@@ -740,6 +771,11 @@ export class WorkflowEngine {
       case 'task.done':
         this.move(t!, 'done');
         if (t!.finalAction) this.usedKeys.add(t!.finalAction.idempotencyKey);
+        // Before M3a the server released actions without executing them, and
+        // `task.done` had no release marker. Never run those on upgrade.
+        if (t!.finalAction && !d.release && !t!.actionResult) {
+          t!.actionResult = { ok: false, detail: 'released before the server executed final actions; it was not executed' };
+        }
         this.escalationStreak.set(t!.ownerId, 0);
         break;
       case 'task.escalated':
