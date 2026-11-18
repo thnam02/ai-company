@@ -7,3 +7,6 @@ coverage/
 .DS_Store
 *.log
 .claude/settings.local.json
+
+# Local event log (SQLite) and other runtime data
+data/

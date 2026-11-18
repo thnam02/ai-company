@@ -1,5 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { resolve } from 'node:path';
 import { WorkflowEngine } from '@ai-company/core';
 import { bootstrapAgents, buildPolicy, loadCompanyConfig, parseCompanyConfig } from '../src/company.ts';
 import { DEFAULT_COMPANY_CONFIG, configFromEnv } from '../src/boot.ts';
@@ -76,11 +77,17 @@ describe('company config', () => {
     assert.match((r as any).error, /Kinds cannot change/);
   });
 
-  test('env config requires a database and a long CEO token, binds to localhost by default', () => {
-    assert.throws(() => configFromEnv({ CEO_TOKEN: 'x'.repeat(16) }), /DATABASE_URL is required/);
-    assert.throws(() => configFromEnv({ DATABASE_URL: 'postgres://x', CEO_TOKEN: 'short' }), /at least 16/);
-    const c = configFromEnv({ DATABASE_URL: 'postgres://x', CEO_TOKEN: 'x'.repeat(16) });
-    assert.equal(c.host, '127.0.0.1');
-    assert.equal(c.port, 4100);
+  test('env config needs a long CEO token, binds to localhost, defaults to a local SQLite file', () => {
+    const CEO_TOKEN = 'x'.repeat(16);
+    assert.throws(() => configFromEnv({}), /CEO_TOKEN is required/);
+    assert.throws(() => configFromEnv({ CEO_TOKEN: 'short' }), /at least 16/);
+    const local = configFromEnv({ CEO_TOKEN });
+    assert.deepEqual(local.store, { kind: 'sqlite', path: resolve('data', 'company.db') });
+    assert.equal(local.host, '127.0.0.1');
+    assert.equal(local.port, 4100);
+    assert.deepEqual(configFromEnv({ CEO_TOKEN, DATA_DIR: '/srv/acme' }).store, { kind: 'sqlite', path: '/srv/acme/company.db' });
+    // DATABASE_URL switches to Postgres.
+    assert.deepEqual(configFromEnv({ CEO_TOKEN, DATABASE_URL: 'postgres://x', DB_SCHEMA: 'acme' }).store, { kind: 'postgres', databaseUrl: 'postgres://x', schema: 'acme' });
+    assert.deepEqual(configFromEnv({ CEO_TOKEN, DATABASE_URL: 'postgres://x' }).store, { kind: 'postgres', databaseUrl: 'postgres://x', schema: 'public' });
   });
 });

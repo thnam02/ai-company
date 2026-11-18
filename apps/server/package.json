@@ -2,7 +2,7 @@
   "name": "@ai-company/server",
   "version": "0.1.0",
   "private": true,
-  "description": "Control-plane server: Postgres event store, CEO HTTP API and WebSocket event stream.",
+  "description": "Control-plane server: SQLite or Postgres event store, CEO HTTP API and WebSocket event stream.",
   "type": "module",
   "scripts": {
     "start": "node src/main.ts"
