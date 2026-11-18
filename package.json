@@ -1,0 +1,22 @@
+{
+  "name": "ai-company",
+  "version": "0.1.0",
+  "private": true,
+  "description": "An AI company workspace: AI agents work as employees in a 3D office, run by a deterministic control plane.",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "test": "node --test \"packages/*/test/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json",
+    "office": "npx --yes serve apps/office"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.8.0"
+  }
+}
