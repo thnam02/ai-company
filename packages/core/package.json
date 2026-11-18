@@ -1,0 +1,10 @@
+{
+  "name": "@ai-company/core",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Control plane: workflow engine, policy engine, limits and event log. No LLM calls here.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}
