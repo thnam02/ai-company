@@ -42,8 +42,8 @@ Agents send requests up to the control plane, which checks them against the rule
 
 | Component | Package | Status |
 | --- | --- | --- |
-| Workflow engine, policy engine, limits, event log | `packages/core` | Done (in-memory store) |
-| Postgres event store, HTTP + WebSocket API | `apps/server` | Milestone 2 |
+| Workflow engine, policy engine, limits, event log | `packages/core` | Done |
+| Postgres event store, HTTP + WebSocket API | `apps/server` | Done |
 | Orchestrator, worker, reviewer agent loops | `packages/agents` | Milestones 3 and 6 |
 | Tool gateway and connectors | `packages/gateway` | Milestone 4 |
 | 3D office UI | `apps/office` | Prototype (simulated agents) |
@@ -129,7 +129,7 @@ Three failed reviews or rejections escalate the task instead of retrying again.
 
 ## Limits and safety controls
 
-Defaults are in `DEFAULT_LIMITS` (`packages/core/src/engine.ts`) and are proposals to tune after testing.
+Defaults are in `DEFAULT_LIMITS` (`packages/core/src/engine.ts`) and are proposals to tune after testing. The server overrides them from `limits` in `apps/server/config/company.json`.
 
 | Control | Scope | Default | At the limit |
 | --- | --- | --- | --- |
@@ -145,11 +145,38 @@ Defaults are in `DEFAULT_LIMITS` (`packages/core/src/engine.ts`) and are proposa
 
 ## Reliability
 
-- **Event sourcing.** Every state change is an event appended to the log. The engine's state is built only by replaying events through one reducer (`apply`), so `WorkflowEngine.fromEvents(log)` rebuilds the company exactly.
+- **Event sourcing.** Every state change is an event appended to the log. The engine's state is built only by replaying events through one reducer (`apply`), so `WorkflowEngine.fromEvents(log)` rebuilds the company exactly. The server rebuilds the engine from Postgres on every boot.
+- **Durable before visible** ([ADR 0002](decisions/0002-durable-before-visible.md)). The engine stays synchronous; the server runs every request through one command queue that awaits a Postgres commit before anything leaves the process: HTTP responses, WebSocket messages and final actions for the gateway. A failed write stops the server, which then rebuilds from the log.
+- **One writer, append-only log.** The `events` table uses `seq` as its primary key, rejects UPDATE, DELETE and TRUNCATE, and is guarded by a Postgres advisory lock so only one server writes to a company's log.
 - **Idempotency keys.** Every tool call and final action carries a key. A key is never allowed twice; a retry gets `{ kind: 'duplicate' }` and the gateway must not execute it again.
 - **Checkpoints.** After each agent step, progress and working notes are saved so a crashed agent resumes where it stopped. *(Milestone 3.)*
 - **Dead-letter queue.** Escalated tasks wait in one place for the CEO instead of disappearing or looping.
 - **Timeouts on every external call**, with retry and backoff for temporary errors only. *(Milestone 4.)*
+
+## Server (`apps/server`)
+
+The server hosts the engine for one company. Configuration (tools and tiers, `autoApproveTier2`, limits, the agent roster) comes from `apps/server/config/company.json`, written by the CEO. On boot the roster is brought in line with the config through engine commands: new agents go through `registerAgent`, changed ones through `updateAgent` (event `agent.updated`), so a tool removed from the config is revoked. An agent deleted from the config keeps its history but loses every tool and is paused; if it is added back, it stays paused until the CEO resumes it. Changing an agent's kind fails the boot (and writes nothing); give the agent a new id instead.
+
+The `events` table needs one direct connection per server (it holds a session advisory lock), so don't put a transaction-pooling proxy in front of it.
+
+Environment: `DATABASE_URL` and `CEO_TOKEN` (16+ characters) are required. `DB_SCHEMA` (default `public`), `HOST` (default `127.0.0.1`), `PORT` (default `4100`) and `COMPANY_CONFIG` are optional.
+
+`GET /health` is open. Every other route needs `Authorization: Bearer <CEO_TOKEN>`; the token is never accepted in an HTTP query string, which would leak into access logs. Engine refusals return 409 (or 404 for an unknown id) with the engine's reason.
+
+| Method and path | Engine command |
+| --- | --- |
+| `GET /health` | None: `{ ok }`, 503 once the server has gone fatal |
+| `GET /state` | Snapshot of agents, goals, tasks, kill-switch state and the `seq` it reflects |
+| `GET /events?since=<seq>` | Up to 1,000 durable events after `seq` |
+| `POST /goals` `{ text, budgetTokens }` | `createGoal` |
+| `POST /tasks/:id/approval` `{ approved, note? }` | `decideApproval`; a released final action goes to the gateway hook, never to the caller. Until milestone 4 no gateway is wired, so approved actions are only logged, not executed |
+| `POST /tasks/:id/resolve` `{ kind: retry \| cancel }` or `{ kind: reassign, ownerId }` | `resolveEscalation` |
+| `POST /agents/:id/pause` · `/resume` · `/unbench` | `pauseAgent` · `resumeAgent` · `unbenchAgent` |
+| `POST /company/pause` `{ reason? }` · `/company/resume` | Kill switch: `pauseCompany` · `resumeCompany` |
+
+**Event stream.** `GET /stream?since=<seq>` upgrades to a WebSocket. Each message is one `EngineEvent` as JSON: first the backlog after `since`, then live events, in `seq` order with no gaps or repeats and only after they are durable. A client that reconnects with the last `seq` it saw resumes exactly where it stopped. Browsers, which cannot set headers on a WebSocket, may pass the token as `?token=` on this path only. Close code 4409 means the resume point is ahead of the log; 4429 means the client fell too far behind and should reconnect.
+
+**Stuck timer.** Every 30 s the server calls `checkStuck()` through the same command queue.
 
 ## Context and memory
 

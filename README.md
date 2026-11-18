@@ -8,9 +8,9 @@ The core rule: **LLMs propose, deterministic code decides.** Agents can't change
 
 | Part | Where | Status |
 | --- | --- | --- |
-| Control plane: workflow engine, policy, limits, event log | `packages/core` | ✅ Done, 35 tests |
+| Control plane: workflow engine, policy, limits, event log | `packages/core` | ✅ Done, 38 tests |
 | 3D office UI | `apps/office` | 🟡 Prototype with simulated agents |
-| Server, Postgres, WebSocket | `apps/server` | ⬜ Milestone 2 |
+| Server, Postgres, WebSocket | `apps/server` | ✅ Done, 44 tests |
 | Real agents (Claude Agent SDK) | `packages/agents` | ⬜ Milestone 3 |
 | Tool gateway | `packages/gateway` | ⬜ Milestone 4 |
 
@@ -21,11 +21,20 @@ Full plan: [`docs/roadmap.md`](docs/roadmap.md) · Design: [`docs/architecture.m
 Requires Node 22.18 or newer (runs TypeScript directly, no build step).
 
 ```bash
-npm install          # only dev tools (typescript, @types/node)
-npm test             # run the control-plane tests
+npm install
+npm test             # all tests; Postgres tests are skipped unless DATABASE_URL is set
 npm run typecheck
 npm run office       # serve the 3D office prototype, then open the printed URL
 ```
+
+To run the server (needs Postgres):
+
+```bash
+createdb ai_company
+DATABASE_URL=postgres://localhost/ai_company CEO_TOKEN=$(openssl rand -hex 24) npm run server
+```
+
+To run the Postgres and crash/restart tests, point `DATABASE_URL` at a disposable database (each test uses its own schema and drops it).
 
 You can also open `apps/office/index.html` directly in a browser.
 
@@ -69,12 +78,13 @@ This repo is set up for [Claude Code](https://claude.com/claude-code):
 - `/safety-review` checks your changes against the invariants.
 - The `architecture-guard` subagent reviews diffs for anything that lets an agent bypass the control plane.
 
-Start a session in the repo root and run `/milestone` to build Milestone 2.
+Start a session in the repo root and run `/milestone` to build the next milestone.
 
 ## Repo layout
 
 ```
 packages/core/   control plane (engine, policy, plan validation, state machine, event log) + tests
+apps/server/     Postgres event store, CEO HTTP API, WebSocket event stream, stuck timer + tests
 apps/office/     3D office prototype (Three.js, single file)
 docs/            architecture, roadmap, decision records
 .claude/         Claude Code commands, subagent and permissions

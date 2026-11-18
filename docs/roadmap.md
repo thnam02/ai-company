@@ -14,17 +14,20 @@ Status: `[x]` done · `[ ]` not started
 - [x] In-memory event store with subscribe
 - [x] 35 tests
 
-## [ ] M2 · Server and persistence (`apps/server`)
+## [x] M2 · Server and persistence (`apps/server`)
 
-- [ ] Postgres `EventStore` implementation (append-only `events` table, `seq` as identity); engine rebuilds on boot
-- [ ] HTTP API for CEO actions: create goal, approve/reject, pause/resume agent, kill switch, resolve escalation
-- [ ] WebSocket stream of events (with resume from `seq`) for the 3D office
-- [ ] Timer that calls `checkStuck()` every 30 s
-- [ ] Integration test: kill the server mid-task, restart, state is identical
+- [x] Postgres `EventStore` implementation (append-only `events` table, `seq` as identity); engine rebuilds on boot
+- [x] HTTP API for CEO actions: create goal, approve/reject, pause/resume agent, kill switch, resolve escalation
+- [x] WebSocket stream of events (with resume from `seq`) for the 3D office
+- [x] Timer that calls `checkStuck()` every 30 s
+- [x] Integration test: kill the server mid-task, restart, state is identical
+- [x] `updateAgent` command (`agent.updated` event) so CEO config changes apply on boot: revoked tools are revoked, agents removed from the config lose all tools and are paused
+- [x] 47 new tests (82 in total); Postgres tests run when `DATABASE_URL` is set (always in CI). See ADR 0002 for the durability design.
 
 ## [ ] M3 · Orchestrator and one worker (`packages/agents`)
 
 - [ ] Agent loop using the Claude Agent SDK; every model turn calls `recordStep` with real token counts
+- [ ] Agent loops get an allowlisted wrapper over the server's `run()` (`submitPlan`, `start`, `recordStep`, `requestToolCall`, `submitForReview`, `recordReview`, `escalate`), never the raw engine or CEO commands such as `updateAgent`
 - [ ] Orchestrator prompt that outputs a JSON plan matching `PlanTask[]`; rejected plans are fed back with the errors (max 3 re-plans, then escalate goal to CEO)
 - [ ] Engineering worker on a test GitHub repo with tools `repo.read` (tier 0) and `github.create_branch` / `github.open_pr` (tier 1)
 - [ ] Context packs: worker sees only its task, criteria and role memory
@@ -35,6 +38,7 @@ Status: `[x]` done · `[ ]` not started
 - [ ] Every tool call goes `engine.requestToolCall` → execute only on `allow`, never on `duplicate`
 - [ ] Credentials stored server-side; never in prompts
 - [ ] Executes `execute` actions returned by `recordReview` / `decideApproval`, keyed by idempotency key
+- [ ] Outbox: approved actions are derived from the log and re-released after a crash; a durable execution record (e.g. an `action.executed` event) keeps the gateway from running any key twice. Replaces M2's at-most-once `onExecute` hook
 - [ ] Timeouts, retry with backoff for transient errors, per-tool rate limits
 - [ ] Records tool results and failures as events
 
@@ -68,3 +72,4 @@ Status: `[x]` done · `[ ]` not started
 - [ ] Agent framework: Claude Agent SDK (current assumption), LangGraph, or our own loop?
 - [ ] Pricing: per agent seat, per task, or pass-through of token cost?
 - [ ] Who besides the CEO can approve tier-3 actions in a customer's company?
+- [ ] CEO auth: M2 uses one shared bearer token (`CEO_TOKEN`). Real users and sessions are needed before anyone else gets access.
