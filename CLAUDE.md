@@ -38,20 +38,30 @@ apps/server/          server (done): SQLite/Postgres event store, CEO HTTP API, 
   src/buffered-store.ts in-memory log, pending buffer and failure handling shared by both stores
   src/sqlite-event-store.ts append-only SQLite log (default), single writer per file
   src/pg-event-store.ts append-only Postgres log, single writer
-  src/boot.ts         env config, store selection, boot sequence
-  config/company.json tools, tiers, limits, agent roster (CEO config)
+  src/boot.ts         env config, store selection, boot sequence, starts agents when AGENTS=on
+  src/sqlite-checkpoint-store.ts agent checkpoints in DATA_DIR/agents.db
+  config/company.json tools, tiers, limits, agent roster, model options (CEO config)
+  config/test-team.json the M3 test team (Ava, Kai, Zara, Rex on ollama:qwen3:8b)
+packages/agents/      agent runtime (M3a): models, tools, role loops — talks to the engine only via AgentPort
+  src/model.ts        ModelProvider interface, "<provider>:<model>" refs
+  src/providers/      OllamaProvider, ScriptedProvider (tests)
+  src/port.ts         AgentPort: the allowlisted engine commands agents may call
+  src/tools/          ToolRegistry, workspace sandbox (files.read/write, fake email.send)
+  src/context.ts      prompts and context packs
+  src/roles.ts        planner, worker and reviewer loops
+  src/runtime.ts      AgentRuntime: one agent at a time, kill switch between turns
 apps/office/          3D office prototype (Three.js, single HTML file, simulated agents)
 docs/                 architecture.md, roadmap.md, decisions/ (ADRs)
 .claude/              commands and subagents for working on this repo
 ```
 
-Planned (see roadmap): `packages/agents` (`ModelProvider` with Ollama and Claude, our own agent loop, M3), `packages/gateway` (tool execution, M4), `apps/desktop` (Electron, M9).
+Planned (see roadmap): `ClaudeProvider` and the live test-team run (M3b), `packages/gateway` (tool execution, M4), `apps/desktop` (Electron, M9).
 
 ## Commands
 
 - `npm test` — run all tests (Node ≥ 22.18 runs `.ts` directly; no build step). SQLite and crash/restart tests always run. Set `DATABASE_URL` to a disposable Postgres database to also run the Postgres store tests and the crash/restart tests against Postgres.
 - `npm run typecheck` — `tsc` strict type check
-- `CEO_TOKEN=<16+ chars> npm run server` — start the server on `127.0.0.1:4100`. No database server needed: the event log is SQLite at `DATA_DIR/company.db` (default `<repo>/data`, git-ignored). Set `DATABASE_URL` (and optionally `DB_SCHEMA`) to use Postgres instead.
+- `CEO_TOKEN=<16+ chars> npm run server` — start the server on `127.0.0.1:4100`. No database server needed: the event log is SQLite at `DATA_DIR/company.db` (default `<repo>/data`, git-ignored). Set `DATABASE_URL` (and optionally `DB_SCHEMA`) to use Postgres instead. Add `AGENTS=on` to start the agents (needs Ollama at `OLLAMA_URL`, default `http://127.0.0.1:11434`); their files go to `WORKSPACE_DIR` (default `<repo>/workspace`).
 - `npm run office` — serve the 3D office prototype
 
 ## Conventions
@@ -59,7 +69,7 @@ Planned (see roadmap): `packages/agents` (`ModelProvider` with Ollama and Claude
 - TypeScript, ESM, strict. Only erasable syntax (no `enum`, no `namespace`, no constructor parameter properties) so Node can strip types. Import local files with the `.ts` extension; use `import type` for types.
 - Keep `packages/core` dependency-free and free of I/O and LLM calls.
 - In `apps/server`, everything that leaves the process (responses, stream messages, gateway actions) goes through the command queue `run()`, which waits for the event store's commit first. Build the response inside the function passed to `run()`; never read engine state after the await.
-- Agent code calls engine commands only through `run()` and acts on a result (e.g. a tool `allow`) only after `run()` resolves.
+- Agent code calls engine commands only through `AgentPort` (built on `run()`) and acts on a result (e.g. a tool `allow`) only after it resolves. Never give agent code the engine, the store or the server.
 - New behaviour starts with a failing test in the matching `test/*.test.ts`. Use `makeCompany()` and `startedTask()` from `test/helpers.ts`.
 - A new event type needs: an emit in a command, a `case` in `apply()`, a test that replays it through `WorkflowEngine.fromEvents`.
 - New tools need a `ToolSpec` with an honest risk tier. When unsure of the tier, pick the higher one.

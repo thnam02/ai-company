@@ -44,7 +44,7 @@ Agents send requests up to the control plane, which checks them against the rule
 | --- | --- | --- |
 | Workflow engine, policy engine, limits, event log | `packages/core` | Done |
 | SQLite and Postgres event stores, HTTP + WebSocket API | `apps/server` | Done |
-| Orchestrator, worker, reviewer agent loops | `packages/agents` | Milestones 3 and 6 |
+| Orchestrator, worker, reviewer agent loops, model providers, workspace tools | `packages/agents` | Runtime done with scripted models (M3a); live run on `qwen3:8b` in M3b |
 | Tool gateway and connectors | `packages/gateway` | Milestone 4 |
 | 3D office UI | `apps/office` | Prototype (simulated agents) |
 
@@ -53,10 +53,10 @@ Agents send requests up to the control plane, which checks them against the rule
 | | Orchestrator | Worker | Reviewer |
 | --- | --- | --- | --- |
 | Job | Turns goals into tasks, assigns them, tracks progress, reports to the CEO | Completes one task | Scores a finished task against its acceptance criteria |
-| Tools | Engine commands only: `submitPlan`, `escalate`, status queries | Real-world tools on its role's allowlist | None: it receives the output and the criteria |
+| Tools | Engine commands only: `submitPlan`, status queries | Real-world tools on its role's allowlist, plus `submit_work` and `report_blocked` | None: it receives the output and the criteria |
 | Can do the work itself | No | Yes | No |
 | Context | All goals, team roster and workload, task summaries | Its task, acceptance criteria, relevant files, role memory | The task, its criteria, the output |
-| Model | Strongest (e.g. Opus) | Matched to the task (e.g. Sonnet or Haiku) | Strong, and different from the author's where possible |
+| Model | Strongest available | Matched to the task | Strong, and different from the author's where possible |
 | Output | Structured JSON plans | Work products plus a short summary | Pass or fail, a score, specific feedback |
 
 Rules:
@@ -120,6 +120,7 @@ Permissions:
 ## Quality gates
 
 1. **Plan check** (`validatePlan`). The plan must give every task an owner who is a worker, acceptance criteria, a positive cost estimate and only tools the owner has. Dependencies must exist and form no cycle, and the total estimate must fit the remaining goal budget. Any failure rejects the plan with every reason listed; the orchestrator re-plans.
+   The goal's planning status (`open` → `planned`, or `escalated`) lives in the engine: a plan is accepted only for an `open` goal, and after more than `maxReplans` (default 3) rejected plans the engine escalates the goal to the CEO. A goal whose budget runs out while it is still being planned is escalated too.
 2. **Self-check** (`submitForReview`). The worker must mark every acceptance criterion met, or the submission is refused.
 3. **Automated checks.** Deterministic checks by output type, run by the gateway before review: tests, linter and build for code; style, link and length rules for content; schema and recipient-allowlist checks for emails. *(Milestone 5.)*
 4. **Independent review** (`recordReview`). A reviewer agent scores the output. A fail needs feedback and sends the task back to `working`.
@@ -134,14 +135,15 @@ Defaults are in `DEFAULT_LIMITS` (`packages/core/src/engine.ts`) and are proposa
 | Control | Scope | Default | At the limit |
 | --- | --- | --- | --- |
 | Step limit | Per task | 30 steps | Escalated |
-| Token cap | Per task | 200,000 tokens | Escalated |
+| Token cap | Per task | 200,000 tokens (a turn that ends after its task stopped is still charged, as `task.usage`) | Escalated |
 | Time limit | Per task | 30 minutes in `working` | Escalated |
 | Review attempts | Per task | 3 | Escalated |
+| Re-plans | Per goal | 3 rejected plans after the first | Goal escalated |
 | Loop detection | Per task | Same tool + input 3 times in a row | Call denied, task escalated |
-| Stuck detection | Per task | 5 minutes without activity | Escalated by `checkStuck()` |
-| Goal budget | Per goal | Set at goal creation | Warning at 80%, open tasks escalated at 100% |
+| Stuck detection | Per task | 5 minutes without activity (not counted while the company or the owner is paused; resuming restarts the clock) | Escalated by `checkStuck()` |
+| Goal budget | Per goal | Set at goal creation; orchestrator and reviewer turns are charged to it with `recordGoalStep` | Warning at 80%, open tasks (and a goal still being planned) escalated at 100% |
 | Circuit breaker | Per agent | 3 escalations in a row | Agent benched until the CEO un-benches it |
-| Kill switch | Whole company | `pauseCompany()` | No task starts and no tool call is allowed |
+| Kill switch | Whole company | `pauseCompany()` | No task starts, no tool call is allowed, no plan or review is recorded, and agents stop before their next model turn |
 
 ## Reliability
 
@@ -149,7 +151,8 @@ Defaults are in `DEFAULT_LIMITS` (`packages/core/src/engine.ts`) and are proposa
 - **Durable before visible** ([ADR 0002](decisions/0002-durable-before-visible.md)). The engine stays synchronous; the server runs every request through one command queue that waits for the store's commit before anything leaves the process: HTTP responses, WebSocket messages and final actions for the gateway. A command's events commit in one transaction, so a crash never leaves half a command in the log. A failed write stops the server, which then rebuilds from the log.
 - **One writer, append-only log.** The `events` table uses `seq` as its primary key and rejects UPDATE and DELETE (and TRUNCATE in Postgres, INSERT OR REPLACE in SQLite). Only one server writes to a company's log: SQLite holds an exclusive lock on a sidecar `company.db.lock` plus an exclusive lock on the log (no other process can even read it while the server runs), Postgres a session advisory lock.
 - **Idempotency keys.** Every tool call and final action carries a key. A key is never allowed twice; a retry gets `{ kind: 'duplicate' }` and the gateway must not execute it again.
-- **Checkpoints.** After each agent step, progress and working notes are saved so a crashed agent resumes where it stopped. *(Milestone 3.)*
+- **Checkpoints.** After each worker turn the conversation is saved to `DATA_DIR/agents.db`, outside the event log, so a crashed agent resumes where it stopped. A checkpoint belongs to one run of a task (`task.startedAt`); a retried or reassigned task starts over, and review feedback is appended when the review count went up. Losing the file only means a task's conversation restarts ([ADR 0003](decisions/0003-agent-runtime.md)).
+- **Execution record.** A released final action runs only after its release is durable, and its result is recorded as `action.executed` or `action.failed`. On boot, a released action with no result is re-run only if its tool dedupes by idempotency key (so a second run cannot act twice); otherwise it is recorded as failed for the CEO to check by hand.
 - **Dead-letter queue.** Escalated tasks wait in one place for the CEO instead of disappearing or looping.
 - **Timeouts on every external call**, with retry and backoff for temporary errors only. *(Milestone 4.)*
 
@@ -159,7 +162,7 @@ The server hosts the engine for one company. Configuration (tools and tiers, `au
 
 **Event store.** By default the log is a SQLite file at `DATA_DIR/company.db` (`DATA_DIR` defaults to `<repo>/data` wherever the server is started from; the directory is created private, mode 0700), so the app needs no database server. The server logs when it creates a new, empty log, which is the sign of a wrong `DATA_DIR` or a missing `DATABASE_URL`. Commits are synchronous with `synchronous=FULL` and `fullfsync` (a real flush to disk on macOS), so each request costs one disk sync; that is plenty for one CEO on one machine. Back up the file only while the server is stopped, and never open it from inside the server process except through the store (see ADR 0002). Keep `DATA_DIR` out of folders synced by iCloud or Dropbox: sync tools ignore SQLite's locks. When `DATABASE_URL` is set, the server uses Postgres instead (for a hosted version later). The Postgres store needs one direct connection per server (it holds a session advisory lock), so don't put a transaction-pooling proxy in front of it.
 
-Environment: `CEO_TOKEN` (16+ characters) is required. Optional: `DATA_DIR` (SQLite, default `./data`), `DATABASE_URL` and `DB_SCHEMA` (Postgres, schema default `public`), `HOST` (default `127.0.0.1`), `PORT` (default `4100`) and `COMPANY_CONFIG`. The server logs which store it uses but never the database URL.
+Environment: `CEO_TOKEN` (16+ characters) is required. Optional: `DATA_DIR` (SQLite log and agent checkpoints, default `<repo>/data`), `AGENTS` (`on` starts the agent runtime; default `off`), `WORKSPACE_DIR` (the only folder agents' file tools reach, default `<repo>/workspace`), `OLLAMA_URL` (default `http://127.0.0.1:11434`), `DATABASE_URL` and `DB_SCHEMA` (Postgres, schema default `public`), `HOST` (default `127.0.0.1`), `PORT` (default `4100`) and `COMPANY_CONFIG`. The server logs which store it uses but never the database URL.
 
 `GET /health` is open. Every other route needs `Authorization: Bearer <CEO_TOKEN>`; the token is never accepted in an HTTP query string, which would leak into access logs. Engine refusals return 409 (or 404 for an unknown id) with the engine's reason.
 
@@ -169,7 +172,7 @@ Environment: `CEO_TOKEN` (16+ characters) is required. Optional: `DATA_DIR` (SQL
 | `GET /state` | Snapshot of agents, goals, tasks, kill-switch state and the `seq` it reflects |
 | `GET /events?since=<seq>` | Up to 1,000 durable events after `seq` |
 | `POST /goals` `{ text, budgetTokens }` | `createGoal` |
-| `POST /tasks/:id/approval` `{ approved, note? }` | `decideApproval`; a released final action goes to the gateway hook, never to the caller. Until milestone 4 no gateway is wired, so approved actions are only logged, not executed |
+| `POST /tasks/:id/approval` `{ approved, note? }` | `decideApproval`; a released final action is executed by the server after the approval is durable, never by the caller, and its result is recorded (`action.executed` / `action.failed`). Until milestone 4 only the workspace tools have executors; an action for any other tool is recorded as failed |
 | `POST /tasks/:id/resolve` `{ kind: retry \| cancel }` or `{ kind: reassign, ownerId }` | `resolveEscalation` |
 | `POST /agents/:id/pause` · `/resume` · `/unbench` | `pauseAgent` · `resumeAgent` · `unbenchAgent` |
 | `POST /company/pause` `{ reason? }` · `/company/resume` | Kill switch: `pauseCompany` · `resumeCompany` |
@@ -177,6 +180,19 @@ Environment: `CEO_TOKEN` (16+ characters) is required. Optional: `DATA_DIR` (SQL
 **Event stream.** `GET /stream?since=<seq>` upgrades to a WebSocket. Each message is one `EngineEvent` as JSON: first the backlog after `since`, then live events, in `seq` order with no gaps or repeats and only after they are durable. A client that reconnects with the last `seq` it saw resumes exactly where it stopped. Browsers, which cannot set headers on a WebSocket, may pass the token as `?token=` on this path only. Close code 4409 means the resume point is ahead of the log; 4429 means the client fell too far behind and should reconnect.
 
 **Stuck timer.** Every 30 s the server calls `checkStuck()` through the same command queue.
+
+## Agents (`packages/agents`)
+
+Agents run inside the server process, one at a time, behind an `AgentPort` ([ADR 0003](decisions/0003-agent-runtime.md)). The port is a frozen object whose only methods are `view`, `submitPlan`, `start`, `recordStep`, `recordGoalStep`, `requestToolCall`, `submitForReview`, `recordReview` and `escalate`, each going through the server's `run()` queue, so an agent acts on a result (a tool `allow`, say) only once it is durable. Agents never see the raw engine, the event store or CEO commands such as `updateAgent` or `resolveEscalation`.
+
+- **Models.** Every model call goes through `ModelProvider.chat`. An agent's model is `"<provider>:<model>"` in the company config (e.g. `"ollama:qwen3:8b"`), with optional per-agent `modelOptions` (`temperature`, `numCtx`, `think`) that stay in the config, never in events. `OllamaProvider` talks to `/api/chat` with tool calls, JSON-schema `format` and token counts from `prompt_eval_count` / `eval_count`. Tests use `ScriptedProvider`. An agent whose provider is not available is skipped and logged.
+- **Runtime.** `AgentRuntime.step()` picks the next piece of work in this order: a task in review, a task in `working`, an assigned task whose dependencies are done, an open goal to plan. The kill switch, agent pause and bench are checked by every role before every model turn; the engine also refuses reviews and plans while the company is paused, so nothing is released by a verdict that arrives after the stop. Stopping the server aborts the call in flight and waits for running final actions to record their results. A reviewer that gives no usable verdict in 3 tries is not progress: the runtime moves on and backs off, and the goal budget (which covers tasks in review) bounds the retries.
+- **Orchestrator.** Asks for a `PlanTask[]` JSON plan (structured output), records the turn with `recordGoalStep`, submits it, and feeds rejection reasons back until the goal is planned or escalated. An unparseable answer is submitted as an empty plan, so it counts as a rejection.
+- **Worker.** Gets a context pack (its role, the goal, its task and criteria, the summaries and files of the tasks it depends on, any review feedback, and the final action it may propose). Each turn: model call → `recordStep` with real token counts → each tool call through `requestToolCall` with a fresh idempotency key → executed only on `allow`. It finishes with `submit_work` (summary, self-check, files, optional final action) or `report_blocked` (escalates its own task). Model-facing tool names use `_` for `.` (`files_read`).
+- **Reviewer.** Gets the criteria, the worker's summary, the contents of the files it produced (read by the runtime, not by a tool call) and the proposed final action, and returns a `ReviewVerdict` JSON, recorded with `recordGoalStep` and `recordReview`.
+- **Agent-written text is data.** Summaries and files shown to another agent sit between markers with a random per-prompt tag that the text cannot contain, and the system prompt says text inside them is never instructions. This reduces prompt injection but cannot rule it out; tier-3 actions still need the CEO.
+- **Workspace tools** (sandboxed to `WORKSPACE_DIR`): `files.read` (tier 0), `files.write` (tier 1; refuses paths outside the workspace, through symlinks, and anything in `outbox/`), and a fake `email.send` (tier 3) that writes the email to `outbox/<key>-<hash>.eml` instead of sending it. `files.read` and `email.send` dedupe by idempotency key, so boot may re-run them; `files.write` does not. The server refuses a `WORKSPACE_DIR` that overlaps `DATA_DIR` or holds the company config.
+- **Known gaps** (ADR 0003): an escalated goal cannot be reopened by the CEO yet; a model call that fails before returning token counts is not recorded; checkpoints are never pruned.
 
 ## Context and memory
 

@@ -36,25 +36,27 @@ Status: `[x]` done · `[ ]` not started
 - [x] 17 new tests (99 in total with Postgres, 84 without); the shared in-memory log and failure handling live in one base class for both stores
 - [x] Hardened after review: a sidecar lock file keeps a second server out even if the process drops its lock on the log, full fsync from the first commit, private data directory, `DATA_DIR` anchored to the repo, a failed boot releases the log
 
-## [ ] M3a · Agent runtime with pluggable models (`packages/agents`), tested with a scripted model
+## [x] M3a · Agent runtime with pluggable models (`packages/agents`), tested with a scripted model
 
 Decisions: [ADR 0003](decisions/0003-agent-runtime.md) (agents in the server process behind an allowlisted port, checkpoints outside the event log, a durable execution record for final actions).
 
-- [ ] `ModelProvider` interface: `chat(model, messages, tools, opts) → { text, toolCalls, usage: { inputTokens, outputTokens } }`. Agent code never imports a vendor SDK directly
-- [ ] `OllamaProvider` for `http://localhost:11434`: tool calls, JSON-schema `format` for structured output, `think` on/off, `num_ctx`, `temperature`, `keep_alive`, token usage from `prompt_eval_count` / `eval_count` (tested against a fake Ollama server)
-- [ ] Model per agent in the company config as `"<provider>:<model>"` (e.g. `"ollama:qwen3:8b"`), with per-agent options `temperature`, `numCtx`, `think`
-- [ ] Every model turn is recorded: workers with `recordStep`, the orchestrator and reviewers with a new `recordGoalStep` charged to the goal budget
-- [ ] Provider-agnostic worker loop: model turn → `recordStep` with real token counts → each tool call through `requestToolCall` → execute only on `allow` → feed the result back
-- [ ] Agent loops get an allowlisted port over the server's `run()` (`submitPlan`, `start`, `recordStep`, `recordGoalStep`, `requestToolCall`, `submitForReview`, `recordReview`, `escalate`, a read-only view), never the raw engine or CEO commands such as `updateAgent`
-- [ ] Goals have a planning status in the engine; the orchestrator outputs a `PlanTask[]` JSON plan via structured output; rejected plans are fed back with the errors; after `maxReplans` (3) re-plans the engine escalates the goal to the CEO
-- [ ] Reviewer outputs a `ReviewVerdict` JSON from the task's acceptance criteria, the worker's summary and the files it produced (basic version; rubrics and automated checks come in M5)
-- [ ] Workspace tools sandboxed to `./workspace`: `files.read` (tier 0), `files.write` (tier 1, refuses any path outside the workspace and the outbox) and a fake `email.send` (tier 3) that writes the email to `workspace/outbox/<idempotency key>.eml` instead of sending it
-- [ ] Durable execution record: a released final action is executed after its release is durable and its result recorded as an event; on boot, released actions with no result are re-run only if their tool dedupes by idempotency key, otherwise marked failed for the CEO
-- [ ] Context packs: a worker sees only its task, its criteria, review feedback, the summaries and files of the tasks it depends on, and its role
-- [ ] Checkpoint after each step (outside the event log, `DATA_DIR/agents.db`); resume after a crash
-- [ ] One agent runs at a time (`maxConcurrentAgents: 1`) so one local model serves every agent on a 16 GB Mac; the kill switch and agent pause stop work between turns
-- [ ] Tests use a scripted fake provider (no real model in CI), including the test team's goal end to end
-- [ ] Agents start with the server only when `AGENTS=on` (default off until M3b proves the live run)
+- [x] `ModelProvider` interface: `chat(model, messages, tools, opts) → { text, toolCalls, usage: { inputTokens, outputTokens } }`. Agent code never imports a vendor SDK directly
+- [x] `OllamaProvider` for `http://localhost:11434`: tool calls, JSON-schema `format` for structured output, `think` on/off, `num_ctx`, `temperature`, `keep_alive`, token usage from `prompt_eval_count` / `eval_count` (tested against a fake Ollama server)
+- [x] Model per agent in the company config as `"<provider>:<model>"` (e.g. `"ollama:qwen3:8b"`), with per-agent options `temperature`, `numCtx`, `think`
+- [x] Every model turn is recorded: workers with `recordStep`, the orchestrator and reviewers with a new `recordGoalStep` charged to the goal budget
+- [x] Provider-agnostic worker loop: model turn → `recordStep` with real token counts → each tool call through `requestToolCall` → execute only on `allow` → feed the result back
+- [x] Agent loops get an allowlisted port over the server's `run()` (`submitPlan`, `start`, `recordStep`, `recordGoalStep`, `requestToolCall`, `submitForReview`, `recordReview`, `escalate`, a read-only view), never the raw engine or CEO commands such as `updateAgent`
+- [x] Goals have a planning status in the engine; the orchestrator outputs a `PlanTask[]` JSON plan via structured output; rejected plans are fed back with the errors; after `maxReplans` (3) re-plans the engine escalates the goal to the CEO
+- [x] Reviewer outputs a `ReviewVerdict` JSON from the task's acceptance criteria, the worker's summary and the files it produced (basic version; rubrics and automated checks come in M5)
+- [x] Workspace tools sandboxed to `./workspace`: `files.read` (tier 0), `files.write` (tier 1, refuses any path outside the workspace and the outbox) and a fake `email.send` (tier 3) that writes the email to `workspace/outbox/<key>-<hash>.eml` instead of sending it (created exclusively, so a re-run never writes it twice)
+- [x] Durable execution record: a released final action is executed after its release is durable and its result recorded as an event; on boot, released actions with no result are re-run only if their tool dedupes by idempotency key, otherwise marked failed for the CEO
+- [x] Context packs: a worker sees only its task, its criteria, review feedback, the summaries and files of the tasks it depends on, and its role
+- [x] Checkpoint after each step (outside the event log, `DATA_DIR/agents.db`); resume after a crash
+- [x] One agent runs at a time (the runtime is sequential) so one local model serves every agent on a 16 GB Mac; the kill switch and agent pause stop work between turns
+- [x] Tests use a scripted fake provider (no real model in CI), including the test team's goal end to end
+- [x] Agents start with the server only when `AGENTS=on` (default off until M3b proves the live run)
+- [x] 48 new tests (147 in total with Postgres, 132 without): core 54, agents 13, server 80 (65 without Postgres), including the test team's goal end to end with scripted models, crash resume, boot recovery, the port allowlist and mutation-checked safety tests
+- [x] Hardened after review: the kill switch stops planner and reviewer turns, and the engine refuses reviews and plans while paused; tasks in review count against the goal budget, so a reviewer that never gives a verdict cannot loop; a turn that ends after its task stopped is still charged (`task.usage`); paused work is not "stuck"; agent-written text is fenced as data in prompts; approvals from older logs are never run on upgrade; `files.write` is not treated as deduping; the workspace may not overlap the data or config; shutdown waits for running final actions; missing Ollama token counts are estimated
 
 ## [ ] M3b · Live test team on `qwen3:8b`, Claude provider
 

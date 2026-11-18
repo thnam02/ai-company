@@ -8,10 +8,10 @@ The core rule: **LLMs propose, deterministic code decides.** Agents can't change
 
 | Part | Where | Status |
 | --- | --- | --- |
-| Control plane: workflow engine, policy, limits, event log | `packages/core` | ✅ Done, 38 tests |
+| Control plane: workflow engine, policy, limits, event log | `packages/core` | ✅ Done, 54 tests |
 | 3D office UI | `apps/office` | 🟡 Prototype with simulated agents |
-| Server, SQLite or Postgres, WebSocket | `apps/server` | ✅ Done, 61 tests |
-| Real agents (Ollama local models, optional Claude) | `packages/agents` | ⬜ Milestone 3 |
+| Server, SQLite or Postgres, WebSocket | `apps/server` | ✅ Done, 80 tests |
+| Agent runtime: orchestrator, workers, reviewer on Ollama models | `packages/agents` | 🟡 Runtime done, 13 tests plus end-to-end server tests with scripted models (M3a); live `qwen3:8b` run and Claude provider next (M3b) |
 | Tool gateway | `packages/gateway` | ⬜ Milestone 4 |
 
 Full plan: [`docs/roadmap.md`](docs/roadmap.md) · Design: [`docs/architecture.md`](docs/architecture.md)
@@ -34,6 +34,14 @@ export CEO_TOKEN=$(openssl rand -hex 24)
 npm run server       # http://127.0.0.1:4100; call it with "Authorization: Bearer $CEO_TOKEN"
 ```
 
+To start the agents as well, run [Ollama](https://ollama.com) with `ollama pull qwen3:8b`, then:
+
+```bash
+AGENTS=on npm run server
+```
+
+Agents work only inside `./workspace` (set `WORKSPACE_DIR` to change it). The fake `email.send` writes emails to `workspace/outbox/` instead of sending them, and only after you approve them. Agents are off by default until the live run is proven (M3b).
+
 To use Postgres instead, set `DATABASE_URL` (e.g. `postgres://localhost/ai_company`). To run the Postgres store tests, and the crash/restart tests against Postgres as well as SQLite, point `DATABASE_URL` at a disposable database (each test uses its own schema and drops it).
 
 You can also open `apps/office/index.html` directly in a browser.
@@ -51,9 +59,9 @@ const policy = new PolicyEngine({
 });
 const engine = new WorkflowEngine({ policy });
 
-engine.registerAgent({ id: 'ava', name: 'Ava', kind: 'orchestrator', role: 'chief-of-staff', model: 'claude-opus-5-5', tools: [] });
-engine.registerAgent({ id: 'omar', name: 'Omar', kind: 'worker', role: 'account-executive', model: 'claude-sonnet-5-5', tools: ['repo.read', 'email.send'] });
-engine.registerAgent({ id: 'rex', name: 'Rex', kind: 'reviewer', role: 'reviewer', model: 'claude-opus-5-5', tools: [] });
+engine.registerAgent({ id: 'ava', name: 'Ava', kind: 'orchestrator', role: 'chief-of-staff', model: 'ollama:qwen3:8b', tools: [] });
+engine.registerAgent({ id: 'omar', name: 'Omar', kind: 'worker', role: 'account-executive', model: 'ollama:qwen3:8b', tools: ['repo.read', 'email.send'] });
+engine.registerAgent({ id: 'rex', name: 'Rex', kind: 'reviewer', role: 'reviewer', model: 'ollama:qwen3:8b', tools: [] });
 
 const goal = engine.createGoal('Send a proposal to Acme', 50_000);
 // The orchestrator's plan is validated (gate 1) before any task exists.
@@ -84,7 +92,8 @@ Start a session in the repo root and run `/milestone` to build the next mileston
 
 ```
 packages/core/   control plane (engine, policy, plan validation, state machine, event log) + tests
-apps/server/     SQLite (default) and Postgres event stores, CEO HTTP API, WebSocket event stream, stuck timer + tests
+packages/agents/ agent runtime: model providers (Ollama, scripted), workspace tools, orchestrator/worker/reviewer loops + tests
+apps/server/     SQLite (default) and Postgres event stores, CEO HTTP API, WebSocket event stream, stuck timer, agent port + tests
 apps/office/     3D office prototype (Three.js, single file)
 docs/            architecture, roadmap, decision records
 .claude/         Claude Code commands, subagent and permissions

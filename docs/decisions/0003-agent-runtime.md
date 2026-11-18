@@ -14,13 +14,27 @@ Milestone 3 adds real agents: an orchestrator that plans, workers that use tools
 
 **Planning state lives in the engine.** A goal is `open` until a plan is accepted, then `planned`. Each rejected plan is counted; after `maxReplans` re-plans the engine itself escalates the goal. The runtime feeds the rejection reasons back to the model but does not decide when to give up.
 
-**Checkpoints live outside the event log.** An agent's conversation for a task (messages, tool results) is saved after every completed turn in a separate SQLite file (`DATA_DIR/agents.db`). It is working memory, not company state: it never changes what the engine decides, and losing it only means the agent starts the task over from its context pack. A checkpoint is written only after the turn's events are durable, so it never runs ahead of the log; after a crash the agent redoes at most its last turn (tool calls get new idempotency keys, so nothing is allowed twice).
+**Checkpoints live outside the event log.** An agent's conversation for a task (messages, tool results) is saved after every completed turn in a separate SQLite file (`DATA_DIR/agents.db`). It is working memory, not company state: it never changes what the engine decides, and losing it only means the agent starts the task over from its context pack. A checkpoint is written only after the turn's events are durable, so it never runs ahead of the log; after a crash the agent redoes at most its last turn. Its tool calls get new idempotency keys, so "never twice" holds per key, not per effect: a tool that ran just before the crash can run again in the redone turn. That is harmless for tiers 0 and 1 inside the workspace; before an auto-approved tier-2 tool exists (M4), the pending call and its key must be checkpointed before `requestToolCall` so the redo reuses the key.
 
-**Final actions get a durable execution record.** When `recordReview` or `decideApproval` releases a final action, the server executes it after that release is durable, then records `action.executed` or `action.failed` through the engine. On boot, every released action without a recorded result is either re-run, if its tool dedupes by idempotency key (the fake `email.send` writes `outbox/<key>.eml` with an exclusive create, so a second run finds the file and does nothing), or recorded as failed ("interrupted; not retried"), so the CEO decides. A key is therefore never executed twice, even across a crash between the effect and its record. Milestone 4 generalises this into the gateway.
+**Final actions get a durable execution record.** When `recordReview` or `decideApproval` releases a final action, the server executes it after that release is durable, then records `action.executed` or `action.failed` through the engine. On boot, every released action without a recorded result is either re-run, if its tool dedupes by idempotency key (the fake `email.send` writes `outbox/<key>-<hash>.eml` with an exclusive create, so a second run finds the file and does nothing), or recorded as failed ("interrupted; not retried"), so the CEO decides. A key is therefore never executed twice, even across a crash between the effect and its record. Milestone 4 generalises this into the gateway.
 
-**Workspace tools are sandboxed.** `files.read` and `files.write` resolve every path inside `./workspace` and refuse anything outside it (including through symlinks). `files.write` also refuses `outbox/`, so a worker cannot fake a sent email without the approval gate.
+Logs written before this record existed have `task.done` events without a release marker; the reducer records those actions as "not executed", so upgrading never runs an old approval.
+
+**Workspace tools are sandboxed.** `files.read` and `files.write` resolve every path inside `./workspace` and refuse anything outside it (including through symlinks). `files.write` also refuses `outbox/`, so a worker cannot fake a sent email without the approval gate. `files.write` does not count as deduping: re-running an old write after a crash could undo a newer one, so an interrupted `files.write` final action is left for the CEO. The server refuses a `WORKSPACE_DIR` that overlaps `DATA_DIR` or holds the company config.
+
+**The pause is checked before every model turn**, by every role, and the engine refuses `recordReview` and `submitPlan` while the company is paused, so a verdict that arrives after the CEO pressed stop releases nothing.
+
+**Agent-written text is data.** Summaries and workspace files shown to the reviewer or to a dependent worker are wrapped in markers with a random per-prompt tag (and the tag is stripped from the text), with a rule that text inside them is never instructions. This lowers, but cannot remove, the risk of prompt injection; the CEO approval gate on tier-3 actions is the real defence.
 
 ## Consequences
+
+Known gaps, left for later milestones:
+
+- An escalated goal (re-plans or budget) has no CEO route to reopen it, raise its budget or cancel it; the CEO creates a new goal (M6).
+- Every `AgentPort` method takes an `agentId` and trusts the in-process runtime to pass its own. An out-of-process port must bind each connection to one agent. The engine does not check that a reviewer charging `recordGoalStep` reviews a task of that goal.
+- The reviewer's runtime reads the task's files from the workspace to build its context pack. That is a tier-0 read by deterministic code, not a tool call by the reviewer, so reviewers still call no tools (invariant 5).
+- A model call that fails after generating (a timeout, a broken response) is not recorded, because no token counts come back. When Ollama omits counts, the provider estimates them (about 4 characters per token) instead of recording 0.
+- Checkpoints are never pruned.
 
 - Agents share the server's event loop. Model calls are async HTTP, so the server stays responsive; a stuck model call is bounded by a request timeout and by the stuck timer.
 - A checkpoint can be lost without harm, so the checkpoint file is not part of backups that matter; the event log is.
