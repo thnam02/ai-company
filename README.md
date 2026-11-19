@@ -11,7 +11,7 @@ The core rule: **LLMs propose, deterministic code decides.** Agents can't change
 | Control plane: workflow engine, policy, limits, event log | `packages/core` | ✅ Done, 54 tests |
 | 3D office UI | `apps/office` | 🟡 Prototype with simulated agents |
 | Server, SQLite or Postgres, WebSocket | `apps/server` | ✅ Done, 80 tests |
-| Agent runtime: orchestrator, workers, reviewer on Ollama models | `packages/agents` | 🟡 Runtime done, 13 tests plus end-to-end server tests with scripted models (M3a); live `qwen3:8b` run and Claude provider next (M3b) |
+| Agent runtime: orchestrator, workers, reviewer on Ollama or Claude models | `packages/agents` | ✅ Done, 20 tests plus end-to-end server tests with scripted models (M3a); the test team passes live on `qwen3:8b` (M3b) |
 | Tool gateway | `packages/gateway` | ⬜ Milestone 4 |
 
 Full plan: [`docs/roadmap.md`](docs/roadmap.md) · Design: [`docs/architecture.md`](docs/architecture.md)
@@ -34,13 +34,9 @@ export CEO_TOKEN=$(openssl rand -hex 24)
 npm run server       # http://127.0.0.1:4100; call it with "Authorization: Bearer $CEO_TOKEN"
 ```
 
-To start the agents as well, run [Ollama](https://ollama.com) with `ollama pull qwen3:8b`, then:
+The agents start with the server. They need [Ollama](https://ollama.com) running with `ollama pull qwen3:8b`; until it is, they wait and retry. Set `AGENTS=off` to run the server without them, and `ANTHROPIC_API_KEY` to let agents use `claude:` models.
 
-```bash
-AGENTS=on npm run server
-```
-
-Agents work only inside `./workspace` (set `WORKSPACE_DIR` to change it). The fake `email.send` writes emails to `workspace/outbox/` instead of sending them, and only after you approve them. Agents are off by default until the live run is proven (M3b).
+Agents work only inside `./workspace` (set `WORKSPACE_DIR` to change it). The fake `email.send` writes emails to `workspace/outbox/` instead of sending them, and only after you approve them.
 
 To use Postgres instead, set `DATABASE_URL` (e.g. `postgres://localhost/ai_company`). To run the Postgres store tests, and the crash/restart tests against Postgres as well as SQLite, point `DATABASE_URL` at a disposable database (each test uses its own schema and drops it).
 

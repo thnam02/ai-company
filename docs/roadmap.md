@@ -42,7 +42,7 @@ Decisions: [ADR 0003](decisions/0003-agent-runtime.md) (agents in the server pro
 
 - [x] `ModelProvider` interface: `chat(model, messages, tools, opts) → { text, toolCalls, usage: { inputTokens, outputTokens } }`. Agent code never imports a vendor SDK directly
 - [x] `OllamaProvider` for `http://localhost:11434`: tool calls, JSON-schema `format` for structured output, `think` on/off, `num_ctx`, `temperature`, `keep_alive`, token usage from `prompt_eval_count` / `eval_count` (tested against a fake Ollama server)
-- [x] Model per agent in the company config as `"<provider>:<model>"` (e.g. `"ollama:qwen3:8b"`), with per-agent options `temperature`, `numCtx`, `think`
+- [x] Model per agent in the company config as `"<provider>:<model>"` (e.g. `"ollama:qwen3:8b"`), with per-agent options `temperature`, `numCtx`, `think` (and `maxTokens` from M3b)
 - [x] Every model turn is recorded: workers with `recordStep`, the orchestrator and reviewers with a new `recordGoalStep` charged to the goal budget
 - [x] Provider-agnostic worker loop: model turn → `recordStep` with real token counts → each tool call through `requestToolCall` → execute only on `allow` → feed the result back
 - [x] Agent loops get an allowlisted port over the server's `run()` (`submitPlan`, `start`, `recordStep`, `recordGoalStep`, `requestToolCall`, `submitForReview`, `recordReview`, `escalate`, a read-only view), never the raw engine or CEO commands such as `updateAgent`
@@ -54,16 +54,20 @@ Decisions: [ADR 0003](decisions/0003-agent-runtime.md) (agents in the server pro
 - [x] Checkpoint after each step (outside the event log, `DATA_DIR/agents.db`); resume after a crash
 - [x] One agent runs at a time (the runtime is sequential) so one local model serves every agent on a 16 GB Mac; the kill switch and agent pause stop work between turns
 - [x] Tests use a scripted fake provider (no real model in CI), including the test team's goal end to end
-- [x] Agents start with the server only when `AGENTS=on` (default off until M3b proves the live run)
+- [x] Agents start with the server only when `AGENTS=on` (default off until M3b proved the live run; on by default since M3b)
 - [x] 48 new tests (147 in total with Postgres, 132 without): core 54, agents 13, server 80 (65 without Postgres), including the test team's goal end to end with scripted models, crash resume, boot recovery, the port allowlist and mutation-checked safety tests
 - [x] Hardened after review: the kill switch stops planner and reviewer turns, and the engine refuses reviews and plans while paused; tasks in review count against the goal budget, so a reviewer that never gives a verdict cannot loop; a turn that ends after its task stopped is still charged (`task.usage`); paused work is not "stuck"; agent-written text is fenced as data in prompts; approvals from older logs are never run on upgrade; `files.write` is not treated as deduping; the workspace may not overlap the data or config; shutdown waits for running final actions; missing Ollama token counts are estimated
 
-## [ ] M3b · Live test team on `qwen3:8b`, Claude provider
+## [x] M3b · Live test team on `qwen3:8b`, Claude provider
 
-- [ ] `ClaudeProvider` (Anthropic API), used only when an API key is configured; the key never enters prompts, events or logs
-- [ ] The acceptance test below passes against a real `qwen3:8b`; one opt-in live test runs when `OLLAMA_URL` is set
-- [ ] Prompts tuned on the live run; `AGENTS=on` becomes the default
-- [ ] Role memory in context packs
+- [x] `ClaudeProvider` (Anthropic API, official SDK), used only when `ANTHROPIC_API_KEY` is set; the key is held in a `Secret` that prints as `[secret]`, is removed from the process environment once read, and never enters prompts, events or logs. No server-side fallback, so the CEO's model is the one that answers; a refused turn is recorded and charged like any other
+- [x] The acceptance test below passes against a real `qwen3:8b`; the opt-in live test (`apps/server/test/live.test.ts`) runs when `OLLAMA_URL` is set
+- [x] Prompts tuned on the live run; agents start by default (`AGENTS=off` to skip them). What the live runs taught: every answer needs a cap (`maxTokens`, Ollama `num_predict`), every agent on one model needs the same `numCtx`, a missing path must say what the workspace holds, the planner needs a concrete ceiling for its estimates (half the budget left), and the goal must name the output file
+- [x] Role memory in context packs: the CEO's notes per role (`roles` in the company config) and up to 5 lessons from same-role tasks that were sent back, fixed and passed, fenced as data
+- [x] Engine: a final action must use a tool in the task's `requiredTools` (a worker attached an email to a task planned only to write a file); the worker is offered only those
+- [x] Run report (`apps/server/src/run-report.ts`) built from the event log alone; the passing live runs are in [docs/runs/2026-11-20-qwen3-8b.md](runs/2026-11-20-qwen3-8b.md)
+- [x] 16 new tests (163 in total with Postgres, 148 without): core 55, agents 20, server 88 (73 without Postgres); the 4 live scenarios are opt-in
+- [x] Hardened after review: review feedback is fenced as data like other agent-written text, and agent log lines are flattened to one line and capped, so model-written text cannot forge log entries
 
 ### M3b acceptance test: the test team
 
@@ -72,20 +76,22 @@ Config `apps/server/config/test-team.json`:
 | Agent | Kind | Model and options | Tools |
 | --- | --- | --- | --- |
 | Ava | orchestrator | `ollama:qwen3:8b`, think on, temperature 0.2 | none |
-| Kai | worker (researcher) | `ollama:qwen3:8b`, think off, temperature 0.2, numCtx 16384 | `files.read`, `files.write` |
-| Zara | worker (writer) | `ollama:qwen3:8b`, think off, temperature 0.3, numCtx 16384 | `files.read`, `files.write`, `email.send` |
+| Kai | worker (researcher) | `ollama:qwen3:8b`, think off, temperature 0.2 | `files.read`, `files.write` |
+| Zara | worker (writer) | `ollama:qwen3:8b`, think off, temperature 0.3, maxTokens 3072 | `files.read`, `files.write`, `email.send` |
 | Rex | reviewer | `ollama:qwen3:8b`, think on, temperature 0.1 | none |
 
-Goal: "Write a one-page product brief for our 3D AI office from the notes in `workspace/notes/`, then draft a launch email to our team."
+Every agent has `numCtx` 12288 and `maxTokens` 4096 unless shown. The config also holds the CEO's notes for each role.
+
+Goal: "Write a one-page product brief for our 3D AI office from the notes in `workspace/notes/` and save it as brief.md, then draft a launch email to our team (team@example.com)."
 
 End to end against a real `qwen3:8b`:
 
-- [ ] Ava's plan has two tasks, Zara's depending on Kai's; Zara starts only after Kai's task is done
-- [ ] Kai writes `workspace/brief.md`; Zara writes the email and proposes `email.send` as her final action
-- [ ] Rex reviews both; a failed review sends the work back with feedback
-- [ ] The email waits for CEO approval; after approval it appears in `workspace/outbox/` exactly once
-- [ ] Safety: impossible criteria escalate after 3 tries; a low step limit escalates; the kill switch stops work mid-task
-- [ ] A run report lists: plans accepted first try, re-plans, first-try review pass rate, tokens and time per task, peak memory
+- [x] Ava's plan has two tasks, Zara's depending on Kai's; Zara starts only after Kai's task is done
+- [x] Kai writes `workspace/brief.md`; Zara writes the email and proposes `email.send` as her final action
+- [x] Rex reviews both; a failed review sends the work back with feedback
+- [x] The email waits for CEO approval; after approval it appears in `workspace/outbox/` exactly once
+- [x] Safety: impossible criteria escalate after 3 tries; a low step limit escalates; the kill switch stops work mid-task (live, Kai reports impossible criteria blocked at once rather than trying 3 times; the 3-review cap is proven with scripted models)
+- [x] A run report lists: plans accepted first try, re-plans, first-try review pass rate, tokens and time per task, peak memory
 
 Round 2 (manual comparison, not required for M3): the same goal with Ava and Rex on `claude:` models.
 

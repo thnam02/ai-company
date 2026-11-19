@@ -38,30 +38,32 @@ apps/server/          server (done): SQLite/Postgres event store, CEO HTTP API, 
   src/buffered-store.ts in-memory log, pending buffer and failure handling shared by both stores
   src/sqlite-event-store.ts append-only SQLite log (default), single writer per file
   src/pg-event-store.ts append-only Postgres log, single writer
-  src/boot.ts         env config, store selection, boot sequence, starts agents when AGENTS=on
+  src/boot.ts         env config, store selection, boot sequence, starts agents unless AGENTS=off
   src/sqlite-checkpoint-store.ts agent checkpoints in DATA_DIR/agents.db
+  src/run-report.ts   run report (plans, reviews, tokens, time) built from the event log
   config/company.json tools, tiers, limits, agent roster, model options (CEO config)
   config/test-team.json the M3 test team (Ava, Kai, Zara, Rex on ollama:qwen3:8b)
 packages/agents/      agent runtime (M3a): models, tools, role loops — talks to the engine only via AgentPort
   src/model.ts        ModelProvider interface, "<provider>:<model>" refs
-  src/providers/      OllamaProvider, ScriptedProvider (tests)
+  src/providers/      OllamaProvider, ClaudeProvider (official SDK, only with a key), ScriptedProvider (tests)
   src/port.ts         AgentPort: the allowlisted engine commands agents may call
   src/tools/          ToolRegistry, workspace sandbox (files.read/write, fake email.send)
   src/context.ts      prompts and context packs
   src/roles.ts        planner, worker and reviewer loops
   src/runtime.ts      AgentRuntime: one agent at a time, kill switch between turns
 apps/office/          3D office prototype (Three.js, single HTML file, simulated agents)
-docs/                 architecture.md, roadmap.md, decisions/ (ADRs)
+docs/                 architecture.md, roadmap.md, decisions/ (ADRs), runs/ (live run reports)
 .claude/              commands and subagents for working on this repo
 ```
 
-Planned (see roadmap): `ClaudeProvider` and the live test-team run (M3b), `packages/gateway` (tool execution, M4), `apps/desktop` (Electron, M9).
+Planned (see roadmap): `packages/gateway` (tool execution, M4), `apps/desktop` (Electron, M9).
 
 ## Commands
 
 - `npm test` — run all tests (Node ≥ 22.18 runs `.ts` directly; no build step). SQLite and crash/restart tests always run. Set `DATABASE_URL` to a disposable Postgres database to also run the Postgres store tests and the crash/restart tests against Postgres.
 - `npm run typecheck` — `tsc` strict type check
-- `CEO_TOKEN=<16+ chars> npm run server` — start the server on `127.0.0.1:4100`. No database server needed: the event log is SQLite at `DATA_DIR/company.db` (default `<repo>/data`, git-ignored). Set `DATABASE_URL` (and optionally `DB_SCHEMA`) to use Postgres instead. Add `AGENTS=on` to start the agents (needs Ollama at `OLLAMA_URL`, default `http://127.0.0.1:11434`); their files go to `WORKSPACE_DIR` (default `<repo>/workspace`).
+- `CEO_TOKEN=<16+ chars> npm run server` — start the server on `127.0.0.1:4100`. No database server needed: the event log is SQLite at `DATA_DIR/company.db` (default `<repo>/data`, git-ignored). Set `DATABASE_URL` (and optionally `DB_SCHEMA`) to use Postgres instead. Agents start too (set `AGENTS=off` to skip them); they need Ollama at `OLLAMA_URL`, default `http://127.0.0.1:11434`; their files go to `WORKSPACE_DIR` (default `<repo>/workspace`). Set `ANTHROPIC_API_KEY` to allow `claude:` models.
+- `OLLAMA_URL=http://127.0.0.1:11434 node --test apps/server/test/live.test.ts` — the M3b acceptance test against a real model (`LIVE_MODEL`, default `qwen3:8b`; `RUN_REPORT=<file>` appends run reports; `LIVE_VERBOSE=1` prints agent logs). Skipped in `npm test` unless `OLLAMA_URL` is set; it takes tens of minutes.
 - `npm run office` — serve the 3D office prototype
 
 ## Conventions
