@@ -26,12 +26,15 @@ export interface CompanyConfig {
   agents: Omit<AgentProfile, 'paused' | 'benched'>[];
   /** Per-agent model options. Runtime config only: never registered with the engine or logged as events. */
   modelOptions: Record<string, ModelOptions>;
+  /** The CEO's notes per role ("how to do this job"), shown to agents with that role. */
+  roleNotes: Record<string, string>;
 }
 
 const OPTION_CHECKS: Record<keyof ModelOptions, (v: unknown) => boolean> = {
   temperature: (v) => typeof v === 'number' && v >= 0 && v <= 2,
   numCtx: (v) => Number.isInteger(v) && (v as number) >= 512 && (v as number) <= 1_048_576,
   think: (v) => typeof v === 'boolean',
+  maxTokens: (v) => Number.isInteger(v) && (v as number) >= 256 && (v as number) <= 131_072,
 };
 
 function parseModelOptions(agentId: string, raw: unknown): ModelOptions {
@@ -40,7 +43,7 @@ function parseModelOptions(agentId: string, raw: unknown): ModelOptions {
   const options: ModelOptions = {};
   for (const [key, value] of Object.entries(raw)) {
     const check = OPTION_CHECKS[key as keyof ModelOptions];
-    if (!check) throw new Error(`agent "${agentId}" has unknown option "${key}" (temperature, numCtx, think)`);
+    if (!check) throw new Error(`agent "${agentId}" has unknown option "${key}" (temperature, numCtx, think, maxTokens)`);
     if (!check(value)) throw new Error(`agent "${agentId}" option ${key} is invalid`);
     (options as Record<string, unknown>)[key] = value;
   }
@@ -114,7 +117,16 @@ export function parseCompanyConfig(raw: unknown): CompanyConfig {
     if (unknown.length) throw new Error(`agent "${a.id}" lists unknown tools: ${unknown.join(', ')}`);
   }
 
-  const config: CompanyConfig = { tools, autoApproveTier2: [...autoApproveTier2], limits, agents, modelOptions };
+  const roleNotes: Record<string, string> = {};
+  if (c.roles !== undefined) {
+    if (typeof c.roles !== 'object' || c.roles === null || Array.isArray(c.roles)) throw new Error('"roles" must be an object of role → notes');
+    for (const [role, notes] of Object.entries(c.roles)) {
+      if (typeof notes !== 'string' || notes.length > 4_000) throw new Error(`notes for role "${role}" must be text of at most 4000 characters`);
+      roleNotes[role] = notes;
+    }
+  }
+
+  const config: CompanyConfig = { tools, autoApproveTier2: [...autoApproveTier2], limits, agents, modelOptions, roleNotes };
   buildPolicy(config); // throws on duplicate tools or a bad auto-approve entry
   return config;
 }

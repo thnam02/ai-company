@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ScriptedProvider } from '@ai-company/agents';
-import { boot, configFromEnv } from '../src/boot.ts';
+import { inspect } from 'node:util';
+import { boot, configFromEnv, modelProviders } from '../src/boot.ts';
 import { SqliteCheckpointStore } from '../src/sqlite-checkpoint-store.ts';
 
 const TEST_TEAM = fileURLToPath(new URL('../config/test-team.json', import.meta.url));
@@ -19,15 +20,43 @@ describe('booting with agents', () => {
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-  test('env config: agents are off unless AGENTS=on; workspace and Ollama have local defaults', () => {
+  test('env config: agents are on unless AGENTS=off; workspace and Ollama have local defaults', () => {
     const base = { CEO_TOKEN: TOKEN };
-    const off = configFromEnv(base);
-    assert.deepEqual(off.agents, { enabled: false, workspaceDir: join(REPO, 'workspace'), ollamaUrl: 'http://127.0.0.1:11434' });
-    assert.equal(off.dataDir, join(REPO, 'data'));
+    const byDefault = configFromEnv(base);
+    assert.deepEqual(byDefault.agents, { enabled: true, workspaceDir: join(REPO, 'workspace'), ollamaUrl: 'http://127.0.0.1:11434' });
+    assert.equal(byDefault.dataDir, join(REPO, 'data'));
+    assert.equal(configFromEnv({ ...base, AGENTS: 'off' }).agents.enabled, false);
     const on = configFromEnv({ ...base, AGENTS: 'on', WORKSPACE_DIR: 'ws', OLLAMA_URL: 'http://127.0.0.1:9999', DATA_DIR: '/srv/x' });
     assert.deepEqual(on.agents, { enabled: true, workspaceDir: resolve('ws'), ollamaUrl: 'http://127.0.0.1:9999' });
     assert.deepEqual(on.store, { kind: 'sqlite', path: '/srv/x/company.db' });
     assert.throws(() => configFromEnv({ ...base, AGENTS: 'yes' }), /AGENTS must be "on" or "off"/);  });
+
+  test('an Anthropic key enables claude: models and can never be printed', () => {
+    const key = 'sk-ant-boot-test-key-must-not-leak';
+    const config = configFromEnv({ CEO_TOKEN: TOKEN, ANTHROPIC_API_KEY: key });
+    assert.ok(config.agents.anthropicApiKey);
+    for (const shown of [JSON.stringify(config), inspect(config, { depth: 10 }), String(config.agents.anthropicApiKey), `${config.agents.anthropicApiKey}`]) {
+      assert.doesNotMatch(shown, new RegExp(key));
+    }
+    assert.deepEqual(Object.keys(modelProviders(config.agents)), ['ollama', 'claude']);
+    assert.deepEqual(Object.keys(modelProviders(configFromEnv({ CEO_TOKEN: TOKEN }).agents)), ['ollama'], 'no key, no claude');
+    assert.doesNotMatch(inspect(modelProviders(config.agents), { depth: 10, showHidden: true }), new RegExp(key));
+  });
+
+  test('the key is taken out of the process environment once read', () => {
+    const key = 'sk-ant-env-test-key-must-not-stay';
+    const saved = { ...process.env };
+    try {
+      process.env.CEO_TOKEN = TOKEN;
+      process.env.ANTHROPIC_API_KEY = key;
+      const config = configFromEnv();
+      assert.equal(config.agents.anthropicApiKey?.reveal(), key);
+      assert.equal(process.env.ANTHROPIC_API_KEY, undefined, 'child processes and env dumps never see it');
+    } finally {
+      for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
+      Object.assign(process.env, saved);
+    }
+  });
 
   test('the workspace may not hold the event log, the checkpoints or the CEO config', () => {
     const base = { CEO_TOKEN: TOKEN, DATA_DIR: '/srv/co/data', COMPANY_CONFIG: '/srv/co/config/company.json' };

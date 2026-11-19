@@ -1,8 +1,10 @@
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkflowEngine } from '@ai-company/core';
+import { inspect } from 'node:util';
 import {
   AgentRuntime,
+  ClaudeProvider,
   OllamaProvider,
   ToolRegistry,
   Workspace,
@@ -23,12 +25,37 @@ import { startStuckTimer } from './stuck-timer.ts';
 /** Where the event log lives: a local SQLite file by default, Postgres when DATABASE_URL is set. */
 export type StoreConfig = { kind: 'sqlite'; path: string } | { kind: 'postgres'; databaseUrl: string; schema: string };
 
+/**
+ * A credential that cannot be printed by accident: logging, JSON or inspect
+ * show "[secret]". Only the provider that needs it calls `reveal()` (invariant 6).
+ */
+export class Secret {
+  readonly #value: string;
+  constructor(value: string) {
+    this.#value = value;
+  }
+  reveal(): string {
+    return this.#value;
+  }
+  toString(): string {
+    return '[secret]';
+  }
+  toJSON(): string {
+    return '[secret]';
+  }
+  [inspect.custom](): string {
+    return '[secret]';
+  }
+}
+
 export interface AgentsConfig {
-  /** AGENTS=on. Off by default until the live run is proven (M3b). */
+  /** On by default; AGENTS=off starts the server without agents. With no goals they stay idle, and if Ollama is down they retry with backoff. */
   enabled: boolean;
   /** The only folder agents' file tools can reach. */
   workspaceDir: string;
   ollamaUrl: string;
+  /** ANTHROPIC_API_KEY: enables `claude:` models. Optional; the app works without it. */
+  anthropicApiKey?: Secret;
 }
 
 export interface BootConfig {
@@ -72,13 +99,18 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): BootConfig 
   if (contains(workspaceDir, companyConfigPath)) {
     throw new Error(`WORKSPACE_DIR (${workspaceDir}) must not contain the company config (${companyConfigPath})`);
   }
+  const anthropicApiKey = env.ANTHROPIC_API_KEY ? new Secret(env.ANTHROPIC_API_KEY) : undefined;
+  // Once held in a Secret, the key leaves the environment, so child
+  // processes and environment dumps never see it (invariant 6).
+  if (env === process.env) delete process.env.ANTHROPIC_API_KEY;
   return {
     store,
     dataDir,
     agents: {
-      enabled: env.AGENTS === 'on',
+      enabled: env.AGENTS !== 'off',
       workspaceDir,
       ollamaUrl: env.OLLAMA_URL || 'http://127.0.0.1:11434',
+      ...(anthropicApiKey ? { anthropicApiKey } : {}),
     },
     ceoToken,
     host: env.HOST || '127.0.0.1',
@@ -108,6 +140,13 @@ export interface BootHooks {
   onFatal?: (err: Error) => void;
   /** Overrides how agents find their model (tests use scripted models). */
   modelFor?: (agent: AgentView) => AgentModel | undefined;
+}
+
+/** Model providers by ref prefix: Ollama always (local), Claude only with an API key. */
+export function modelProviders(agents: AgentsConfig): Record<string, ModelProvider> {
+  const providers: Record<string, ModelProvider> = { ollama: new OllamaProvider({ baseUrl: agents.ollamaUrl }) };
+  if (agents.anthropicApiKey) providers.claude = new ClaudeProvider({ apiKey: agents.anthropicApiKey.reveal() });
+  return providers;
 }
 
 export async function openStore(config: StoreConfig): Promise<DurableEventStore> {
@@ -176,7 +215,7 @@ export async function boot(config: BootConfig, hooks: BootHooks = {}): Promise<R
 
     if (config.agents.enabled) {
       checkpoints = SqliteCheckpointStore.open({ path: join(config.dataDir, 'agents.db') });
-      const providers: Record<string, ModelProvider> = { ollama: new OllamaProvider({ baseUrl: config.agents.ollamaUrl }) };
+      const providers = modelProviders(config.agents);
       const modelFor =
         hooks.modelFor ??
         ((agent: AgentView): AgentModel | undefined => {
@@ -184,11 +223,19 @@ export async function boot(config: BootConfig, hooks: BootHooks = {}): Promise<R
           const provider = ref && providers[ref.provider];
           return provider ? { provider, model: ref.model, options: company.modelOptions[agent.id] } : undefined;
         });
-      runtime = new AgentRuntime({ port: server.agentPort, modelFor, tools, workspace, checkpoints, log: (m) => console.error(`[agents] ${m}`) });
+      runtime = new AgentRuntime({
+        port: server.agentPort,
+        modelFor,
+        tools,
+        workspace,
+        checkpoints,
+        roleNotes: company.roleNotes,
+        log: (m) => console.error(`[agents] ${m}`),
+      });
       runtime.start();
-      log(`agents on; workspace ${workspace.root}`);
+      log(`agents on; workspace ${workspace.root}; model providers: ${Object.keys(providers).join(', ')}`);
     } else {
-      log('agents off (set AGENTS=on to start them)');
+      log('agents off (AGENTS=off)');
     }
 
     const running = server;

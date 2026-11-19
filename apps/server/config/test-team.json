@@ -6,10 +6,16 @@
   ],
   "autoApproveTier2": [],
   "limits": {},
+  "roles": {
+    "chief-of-staff": "Documents built from notes (briefs, summaries) go to the researcher; emails and other copy go to the writer. Only a task that sends something lists email.send in requiredTools.",
+    "researcher": "You turn notes into documents. Read every file the task points to with files_read, write the result with files_write, then submit_work listing the file in artifacts. Use only facts from the notes.",
+    "writer": "You write short, clear copy. Read the files your task builds on first. For an email, do not write it to a file: put it in submit_work as finalAction with tool email.send and input { to, subject, body }.",
+    "reviewer": "Judge only against the acceptance criteria. Fail work only for a criterion that is clearly not met, and say exactly what to change."
+  },
   "agents": [
-    { "id": "ava", "name": "Ava", "kind": "orchestrator", "role": "chief-of-staff", "model": "ollama:qwen3:8b", "options": { "think": true, "temperature": 0.2 }, "tools": [] },
-    { "id": "kai", "name": "Kai", "kind": "worker", "role": "researcher", "model": "ollama:qwen3:8b", "options": { "think": false, "temperature": 0.2, "numCtx": 16384 }, "tools": ["files.read", "files.write"] },
-    { "id": "zara", "name": "Zara", "kind": "worker", "role": "writer", "model": "ollama:qwen3:8b", "options": { "think": false, "temperature": 0.3, "numCtx": 16384 }, "tools": ["files.read", "files.write", "email.send"] },
-    { "id": "rex", "name": "Rex", "kind": "reviewer", "role": "reviewer", "model": "ollama:qwen3:8b", "options": { "think": true, "temperature": 0.1 }, "tools": [] }
+    { "id": "ava", "name": "Ava", "kind": "orchestrator", "role": "chief-of-staff", "model": "ollama:qwen3:8b", "options": { "think": true, "temperature": 0.2, "numCtx": 12288, "maxTokens": 4096 }, "tools": [] },
+    { "id": "kai", "name": "Kai", "kind": "worker", "role": "researcher", "model": "ollama:qwen3:8b", "options": { "think": false, "temperature": 0.2, "numCtx": 12288, "maxTokens": 4096 }, "tools": ["files.read", "files.write"] },
+    { "id": "zara", "name": "Zara", "kind": "worker", "role": "writer", "model": "ollama:qwen3:8b", "options": { "think": false, "temperature": 0.3, "numCtx": 12288, "maxTokens": 3072 }, "tools": ["files.read", "files.write", "email.send"] },
+    { "id": "rex", "name": "Rex", "kind": "reviewer", "role": "reviewer", "model": "ollama:qwen3:8b", "options": { "think": true, "temperature": 0.1, "numCtx": 12288, "maxTokens": 4096 }, "tools": [] }
   ]
 }
