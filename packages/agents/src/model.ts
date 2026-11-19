@@ -11,9 +11,19 @@ export interface ToolCall {
   arguments: Record<string, unknown>;
 }
 
+/**
+ * A provider's own record of an answer (e.g. Claude's content blocks with
+ * thinking), replayed unchanged by that provider on the next turn. Opaque to
+ * agent code; it never holds credentials.
+ */
+export interface ProviderRaw {
+  provider: string;
+  content: unknown;
+}
+
 export type ChatMessage =
   | { role: 'system' | 'user'; content: string }
-  | { role: 'assistant'; content: string; toolCalls?: ToolCall[] }
+  | { role: 'assistant'; content: string; toolCalls?: ToolCall[]; raw?: ProviderRaw }
   | { role: 'tool'; content: string; toolCallId: string; name: string };
 
 export interface ToolDefinition {
@@ -27,6 +37,12 @@ export interface ModelOptions {
   temperature?: number;
   numCtx?: number;
   think?: boolean;
+  /**
+   * Most tokens one answer may generate, thinking included. A capped call
+   * always comes back (and is recorded); an uncapped local model can think
+   * until the request times out, and a timed-out call records nothing.
+   */
+  maxTokens?: number;
 }
 
 export interface ChatRequest {
@@ -49,6 +65,8 @@ export interface ChatResult {
   text: string;
   toolCalls: ToolCall[];
   usage: Usage;
+  /** Keep on the assistant message so the provider can replay it unchanged. */
+  raw?: ProviderRaw;
 }
 
 export interface ModelProvider {

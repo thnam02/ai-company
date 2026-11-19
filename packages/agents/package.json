@@ -8,6 +8,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@ai-company/core": "0.1.0"
+    "@ai-company/core": "0.1.0",
+    "@anthropic-ai/sdk": "^1.10.0"
   }
 }
