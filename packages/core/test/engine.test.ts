@@ -92,6 +92,19 @@ describe('risk tiers and approvals (gate 5)', () => {
     assert.equal(engine.decideApproval(t.id, { approved: true }).ok, false, 'cannot approve twice');
   });
 
+  test('a final action must use a tool the plan gave the task', () => {
+    const { engine } = makeCompany();
+    const { task: t } = startedTask(engine, { ownerId: 'omar', requiredTools: ['repo.read'] });
+    const r = engine.submitForReview(t.id, 'omar', {
+      summary: 's',
+      selfCheck: allMet(t.acceptanceCriteria),
+      finalAction: { tool: 'email.send', input: {}, idempotencyKey: 'not-planned' },
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.ok ? '' : r.error, /email\.send is not in this task's requiredTools/);
+    assert.equal(engine.getTask(t.id)!.state, 'working', 'nothing was submitted');
+  });
+
   test('a rejected approval sends the task back with the note', () => {
     const { engine } = makeCompany();
     const { task: t } = startedTask(engine, { ownerId: 'omar', requiredTools: ['email.send'] });
@@ -405,7 +418,7 @@ describe('artifacts and the final-action execution record', () => {
 describe('agent runtime safety: kill switch, budgets and usage', () => {
   test('while the company is paused no review is recorded and no plan is accepted, so nothing is released', () => {
     const { engine } = makeCompany();
-    const { task: t } = startedTask(engine, { requiredTools: ['repo.read'] });
+    const { task: t } = startedTask(engine, { requiredTools: ['repo.read', 'github.create_branch'] });
     const action = { tool: 'github.create_branch', input: { name: 'x' }, idempotencyKey: 'branch-1' };
     must(engine.submitForReview(t.id, 'kai', { summary: 'Done', selfCheck: allMet(t.acceptanceCriteria), finalAction: action }));
     must(engine.pauseCompany('stop'));
@@ -499,7 +512,7 @@ describe('agent runtime safety: kill switch, budgets and usage', () => {
 
   test('action.failed replays', () => {
     const { engine, options } = makeCompany();
-    const { task: t } = startedTask(engine);
+    const { task: t } = startedTask(engine, { requiredTools: ['repo.read', 'github.create_branch'] });
     must(engine.submitForReview(t.id, 'kai', { summary: 'Done', selfCheck: allMet(t.acceptanceCriteria), finalAction: { tool: 'github.create_branch', input: {}, idempotencyKey: 'b-1' } }));
     must(engine.recordReview(t.id, 'rex', { passed: true, score: 1, feedback: '' }));
     must(engine.recordActionResult(t.id, 'b-1', { ok: false, detail: 'boom' }));

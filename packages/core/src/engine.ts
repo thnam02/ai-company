@@ -444,6 +444,8 @@ export class WorkflowEngine {
       const fa = submission.finalAction;
       if (!fa.idempotencyKey) return fail('finalAction needs an idempotency key');
       if (this.usedKeys.has(fa.idempotencyKey)) return fail('finalAction idempotency key was already used');
+      // The plan decides what a task may do: a worker cannot add an action it was not planned for.
+      if (!t.requiredTools.includes(fa.tool)) return fail(`${fa.tool} is not in this task's requiredTools (${t.requiredTools.join(', ') || 'none'}); submit without a finalAction`);
       const decision = this.policy.check(this.agents.get(agentId)!, fa.tool);
       if (decision.kind === 'deny') return fail(decision.reason);
       finalAction = { tool: fa.tool, input: fa.input, idempotencyKey: fa.idempotencyKey, needsApproval: decision.kind === 'needs_approval' };
