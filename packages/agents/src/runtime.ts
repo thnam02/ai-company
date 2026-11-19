@@ -19,6 +19,8 @@ export interface RuntimeOptions {
   /** Longest wait after a model error (doubling from 1 s). Default 60 s. */
   maxBackoffMs?: number;
   newKey?: () => string;
+  /** The CEO's notes per role ("how to do this job"), from the company config. Read-only for agents. */
+  roleNotes?: Record<string, string>;
 }
 
 /**
@@ -36,7 +38,8 @@ export class AgentRuntime {
 
   constructor(options: RuntimeOptions) {
     this.options = options;
-    this.log = options.log ?? ((m) => console.error(`[agents] ${m}`));
+    const write = options.log ?? ((m) => console.error(`[agents] ${m}`));
+    this.log = (m) => write(oneLine(m));
   }
 
   /**
@@ -139,6 +142,7 @@ export class AgentRuntime {
       workspace: this.options.workspace,
       checkpoints: this.options.checkpoints,
       newKey: this.options.newKey ?? (() => randomUUID()),
+      ...(this.options.roleNotes?.[agent.role] ? { roleNotes: this.options.roleNotes[agent.role] } : {}),
       log: this.log,
       ...(signal ? { signal } : {}),
     };
@@ -155,4 +159,17 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
     }
     signal.addEventListener('abort', done, { once: true });
   });
+}
+
+/** Longest agent log line; the rest is cut. */
+const MAX_LOG_LINE = 1_000;
+
+/**
+ * Log lines carry model-written text (titles, plan keys, errors). Control
+ * characters become spaces and the line is capped, so that text cannot
+ * forge extra log entries or flood the log.
+ */
+export function oneLine(message: string): string {
+  const flat = message.replace(/[\u0000-\u001f\u007f]+/g, ' ');
+  return flat.length > MAX_LOG_LINE ? `${flat.slice(0, MAX_LOG_LINE - 1)}…` : flat;
 }

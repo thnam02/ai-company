@@ -1,7 +1,7 @@
 import type { Goal, PlanTask, Task } from '@ai-company/core';
 import type { CheckpointStore } from './checkpoints.ts';
-import { PLAN_SCHEMA, VERDICT_SCHEMA, feedbackMessage, newFenceTag, plannerPrompt, reviewerPrompt, workerSystem, workerTask } from './context.ts';
-import { totalTokens, type ChatMessage, type ModelOptions, type ModelProvider, type ToolCall, type ToolDefinition } from './model.ts';
+import { PLAN_SCHEMA, VERDICT_SCHEMA, feedbackMessage, newFenceTag, plannerPrompt, reviewerPrompt, roleMemory, workerSystem, workerTask } from './context.ts';
+import { totalTokens, type ChatMessage, type ChatResult, type ModelOptions, type ModelProvider, type ToolCall, type ToolDefinition } from './model.ts';
 import type { AgentPort, AgentView, CompanyView } from './port.ts';
 import type { ToolRegistry } from './tools/registry.ts';
 import { ToolInputError, type Workspace } from './tools/workspace.ts';
@@ -21,6 +21,8 @@ export interface RoleContext {
   workspace: Workspace;
   checkpoints: CheckpointStore;
   newKey: () => string;
+  /** The CEO's notes for this agent's role. */
+  roleNotes?: string;
   signal?: AbortSignal;
   log: (message: string) => void;
 }
@@ -40,7 +42,7 @@ const BLOCKED = 'report_blocked';
  * engine's reasons; the engine decides when to stop (maxReplans, budget).
  */
 export async function runPlanner(ctx: RoleContext, goal: Goal, view: CompanyView): Promise<Progress> {
-  const { system, user } = plannerPrompt(ctx.agent, goal, view);
+  const { system, user } = plannerPrompt(ctx.agent, goal, view, ctx.roleNotes);
   const messages: ChatMessage[] = [{ role: 'system', content: system }, { role: 'user', content: user }];
   let progress = false;
   for (;;) {
@@ -52,7 +54,7 @@ export async function runPlanner(ctx: RoleContext, goal: Goal, view: CompanyView
       return progress;
     }
     progress = true;
-    messages.push({ role: 'assistant', content: result.text });
+    messages.push(answer(result));
 
     const parsed = parseJson(result.text);
     const plan = Array.isArray(parsed?.tasks) ? (parsed.tasks as PlanTask[]) : [];
@@ -68,6 +70,7 @@ export async function runPlanner(ctx: RoleContext, goal: Goal, view: CompanyView
       return progress;
     }
     const reason = parsed ? submitted.error : `Your answer was not valid JSON matching the schema. ${submitted.error}`;
+    ctx.log(`${ctx.agent.name}'s plan for "${goal.text}" was rejected: ${reason}`);
     messages.push({ role: 'user', content: `The plan was rejected:\n${reason}\nFix every problem and answer with the complete corrected plan.` });
   }
 }
@@ -93,7 +96,8 @@ export async function runWorker(ctx: RoleContext, task: Task, view: CompanyView)
 
   const run = task.startedAt ?? 0;
   const callable = agent.tools.filter((t) => agent.toolAccess[t] === 'call' && ctx.tools.has(t));
-  const finalTools = agent.tools.filter((t) => agent.toolAccess[t] === 'final' && ctx.tools.has(t));
+  // Final actions only for tools the plan gave this task: the engine refuses any other.
+  const finalTools = agent.tools.filter((t) => agent.toolAccess[t] === 'final' && ctx.tools.has(t) && task.requiredTools.includes(t));
   const { definitions, toolName } = workerTools(ctx, callable, finalTools);
 
   // Resume from the checkpoint of this run, adding feedback that arrived since.
@@ -107,7 +111,7 @@ export async function runWorker(ctx: RoleContext, task: Task, view: CompanyView)
     const tag = newFenceTag();
     messages = [
       { role: 'system', content: workerSystem(agent, tag) },
-      { role: 'user', content: workerTask(task, goal, view, finalTools, tag) },
+      { role: 'user', content: workerTask(task, goal, view, finalTools, tag, roleMemory(agent, view, task.id, ctx.roleNotes, tag)) },
     ];
   }
   const checkpoint = () => ctx.checkpoints.save({ taskId: task.id, agentId: agent.id, run, attempt: task.reviewAttempts, messages });
@@ -134,7 +138,7 @@ export async function runWorker(ctx: RoleContext, task: Task, view: CompanyView)
       ctx.log(`${agent.name}'s task "${task.title}" is now ${stepped.value}`);
       return progress;
     }
-    messages.push({ role: 'assistant', content: result.text, ...(result.toolCalls.length ? { toolCalls: result.toolCalls } : {}) });
+    messages.push(answer(result));
 
     if (result.toolCalls.length === 0) {
       messages.push({ role: 'user', content: `Use a tool, call ${SUBMIT} when every criterion is met, or ${BLOCKED} if you cannot continue.` });
@@ -271,7 +275,7 @@ export async function runReviewer(ctx: RoleContext, task: Task): Promise<Progres
     }
     return { path, content: content.length > MAX_REVIEW_FILE ? `${content.slice(0, MAX_REVIEW_FILE)}\n… (truncated)` : content };
   });
-  const { system, user } = reviewerPrompt(ctx.agent, task, files);
+  const { system, user } = reviewerPrompt(ctx.agent, task, files, newFenceTag(), ctx.roleNotes);
   const messages: ChatMessage[] = [{ role: 'system', content: system }, { role: 'user', content: user }];
   for (let attempt = 0; attempt < 3; attempt++) {
     if (!(await mayWork(ctx))) return false;
@@ -289,9 +293,9 @@ export async function runReviewer(ctx: RoleContext, task: Task): Promise<Progres
       // The task moved on (paused company, budget, CEO): stop instead of retrying.
       const now = (await ctx.port.view()).tasks.find((t) => t.id === task.id);
       if (now?.state !== 'review') return false;
-      messages.push({ role: 'assistant', content: result.text }, { role: 'user', content: `That verdict was refused: ${reviewed.error}. Answer again.` });
+      messages.push(answer(result), { role: 'user', content: `That verdict was refused: ${reviewed.error}. Answer again.` });
     } else {
-      messages.push({ role: 'assistant', content: result.text }, { role: 'user', content: 'Answer only with JSON: {"passed": boolean, "score": number, "feedback": string}.' });
+      messages.push(answer(result), { role: 'user', content: 'Answer only with JSON: {"passed": boolean, "score": number, "feedback": string}.' });
     }
   }
   // Not progress: the runtime moves on to other work and backs off, and the
@@ -301,6 +305,16 @@ export async function runReviewer(ctx: RoleContext, task: Task): Promise<Progres
 }
 
 // ───────────────────────── shared ─────────────────────────
+
+/** The model's answer as it goes back into the conversation, with the provider's raw record. */
+function answer(result: ChatResult): ChatMessage {
+  return {
+    role: 'assistant',
+    content: result.text,
+    ...(result.toolCalls.length ? { toolCalls: result.toolCalls } : {}),
+    ...(result.raw ? { raw: result.raw } : {}),
+  };
+}
 
 /** Before every model turn: the kill switch, a pause or the bench stops the agent. */
 async function mayWork(ctx: RoleContext): Promise<boolean> {

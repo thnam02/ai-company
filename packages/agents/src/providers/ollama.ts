@@ -9,6 +9,9 @@ export interface OllamaOptions {
   keepAlive?: string;
 }
 
+/** Default cap on one answer, thinking included, when the agent's config sets no `maxTokens`. */
+export const DEFAULT_MAX_TOKENS = 8_192;
+
 /** Local models through Ollama's /api/chat (no SDK, plain HTTP). */
 export class OllamaProvider implements ModelProvider {
   readonly id = 'ollama';
@@ -35,10 +38,11 @@ export class OllamaProvider implements ModelProvider {
     if (request.format) body.format = request.format;
     const o = request.options ?? {};
     if (o.think !== undefined) body.think = o.think;
-    const options: Record<string, number> = {};
+    // Always capped: Ollama's default is unlimited, and a thinking model can run until the timeout.
+    const options: Record<string, number> = { num_predict: o.maxTokens ?? DEFAULT_MAX_TOKENS };
     if (o.temperature !== undefined) options.temperature = o.temperature;
     if (o.numCtx !== undefined) options.num_ctx = o.numCtx;
-    if (Object.keys(options).length) body.options = options;
+    body.options = options;
 
     const timeout = AbortSignal.timeout(this.timeoutMs);
     const res = await fetch(`${this.baseUrl}/api/chat`, {

@@ -61,7 +61,7 @@ describe('OllamaProvider', () => {
       ],
       tools: [{ name: 'files.read', description: 'Read a file', parameters: { type: 'object', properties: { path: { type: 'string' } } } }],
       format: { type: 'object' },
-      options: { temperature: 0.2, numCtx: 16384, think: false },
+      options: { temperature: 0.2, numCtx: 16384, think: false, maxTokens: 3000 },
     });
 
     assert.deepEqual(result, {
@@ -84,7 +84,7 @@ describe('OllamaProvider', () => {
       stream: false,
       think: false,
       keep_alive: '10m',
-      options: { temperature: 0.2, num_ctx: 16384 },
+      options: { num_predict: 3000, temperature: 0.2, num_ctx: 16384 },
     });
   });
 
@@ -95,7 +95,8 @@ describe('OllamaProvider', () => {
     const result = await new OllamaProvider({ baseUrl: url }).chat({ model: 'qwen3:8b', messages: [{ role: 'user', content: 'hi' }] });
     assert.deepEqual(result.toolCalls, [{ id: 'x9', name: 'files.write', arguments: { path: 'a.md', content: 'hi' } }]);
     assert.equal(result.usage.estimated, true, 'no counts sent, so they are estimated');
-    assert.deepEqual(Object.keys(fake.bodies[0].body).sort(), ['keep_alive', 'messages', 'model', 'stream']);
+    assert.deepEqual(Object.keys(fake.bodies[0].body).sort(), ['keep_alive', 'messages', 'model', 'options', 'stream']);
+    assert.deepEqual(fake.bodies[0].body.options, { num_predict: 8_192 }, 'every answer is capped, even with no options');
   });
 
   test('turns HTTP errors and timeouts into errors', async () => {

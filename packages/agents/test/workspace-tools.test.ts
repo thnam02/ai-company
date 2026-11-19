@@ -28,6 +28,16 @@ describe('workspace tools', () => {
     assert.equal(await run('files.read', { path: '.' }), 'notes/idea.md');
   });
 
+  test('a missing path says paths are relative and shows what the workspace holds', async () => {
+    await assert.rejects(run('files.read', { path: 'workspace/notes/idea.md' }), (err: Error) => {
+      assert.ok(err instanceof ToolInputError);
+      assert.match(err.message, /"workspace\/notes\/idea\.md" does not exist/);
+      assert.match(err.message, /relative to the workspace/);
+      assert.match(err.message, /notes\/idea\.md/);
+      return true;
+    });
+  });
+
   test('paths outside the workspace are refused, including through symlinks', async () => {
     symlinkSync(join(dir, 'secret.txt'), join(dir, 'workspace', 'link.txt'));
     symlinkSync(dir, join(dir, 'workspace', 'up'));

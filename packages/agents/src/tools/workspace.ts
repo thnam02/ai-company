@@ -9,6 +9,8 @@ export class ToolInputError extends Error {}
 const MAX_READ_BYTES = 100_000;
 const MAX_WRITE_BYTES = 200_000;
 const MAX_LISTING = 200;
+/** Files named in a "does not exist" error. */
+const HINT_FILES = 20;
 const OUTBOX = 'outbox';
 
 /**
@@ -58,7 +60,18 @@ export class Workspace {
 
   read(path: unknown): string {
     const full = this.resolve(path);
-    if (!exists(full)) throw new ToolInputError(`"${String(path)}" does not exist`);
+    if (!exists(full)) {
+      // Say what is there, so an agent that guessed a path can recover.
+      let files: string[] = [];
+      try {
+        files = this.list(this.root).slice(0, HINT_FILES);
+      } catch {
+        // An unreadable folder: give the error without the hint.
+      }
+      throw new ToolInputError(
+        `"${String(path)}" does not exist. Paths are relative to the workspace${files.length ? `; it contains: ${files.join(', ')}` : ''}`,
+      );
+    }
     if (statSync(full).isDirectory()) return this.list(full).join('\n') || '(empty folder)';
     const buf = readFileSync(full);
     const text = buf.subarray(0, MAX_READ_BYTES).toString('utf8');

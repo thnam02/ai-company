@@ -6,7 +6,8 @@ import type { AgentView, CompanyView } from './port.ts';
 /**
  * Context packs: what each agent is shown. A worker sees only its own task,
  * its criteria, review feedback, the results of the tasks it depends on and
- * its role, never other agents' conversations or unrelated tasks.
+ * its role memory (the CEO's notes, and the title and feedback of a few past
+ * tasks of its role), never other agents' conversations.
  */
 
 const list = (items: string[]) => items.map((i) => `- ${i}`).join('\n');
@@ -48,24 +49,33 @@ export const PLAN_SCHEMA: JsonSchema = {
           costEstimateTokens: { type: 'integer' },
         },
         required: ['key', 'title', 'acceptanceCriteria', 'ownerId', 'requiredTools', 'dependsOn', 'costEstimateTokens'],
+        additionalProperties: false,
       },
     },
   },
   required: ['tasks'],
+  additionalProperties: false,
 };
 
-export function plannerPrompt(agent: AgentView, goal: Goal, view: CompanyView): { system: string; user: string } {
+const notesFor = (notes: string | undefined) => (notes?.trim() ? [`How to do your job (from the CEO):\n${notes.trim()}`] : []);
+
+export function plannerPrompt(agent: AgentView, goal: Goal, view: CompanyView, notes?: string): { system: string; user: string } {
   const workers = view.agents.filter((a) => a.kind === 'worker' && !a.benched);
   const roster = workers.map((w) => `${w.id} (${w.name}, ${w.role}); tools: ${w.tools.length ? w.tools.join(', ') : 'none'}`);
   const tools = view.tools.map((t) => `${t.name} (tier ${t.tier})${t.description ? `: ${t.description}` : ''}`);
+  const left = goal.budgetTokens - goal.spentTokens;
+  // Half is left for reviews, rework and re-plans; a total equal to the budget
+  // left is always over by the time the plan is checked.
+  const ceiling = Math.floor(left / 2);
   return {
     system: [
       `You are ${agent.name}, the chief of staff of an AI company. You turn the CEO's goal into a small plan of tasks for the workers.`,
       'You never do the work yourself. Answer only with JSON matching the schema.',
+      ...notesFor(notes),
     ].join('\n'),
     user: [
       `Goal: ${goal.text}`,
-      `Token budget left for the whole goal: ${goal.budgetTokens - goal.spentTokens}`,
+      `Token budget left for the whole goal: ${left}`,
       '',
       'Workers (use the id as ownerId):',
       list(roster),
@@ -75,10 +85,12 @@ export function plannerPrompt(agent: AgentView, goal: Goal, view: CompanyView): 
       '',
       'Rules:',
       list([
-        'Use as few tasks as the goal needs. Each task has one owner, a short title and 1–4 concrete, checkable acceptance criteria.',
+        'Make one task per deliverable (a file, an email). Workers read the files they need themselves: never make a task only to read, research or summarise for another worker.',
+        'Give each task to the worker whose role fits it best. A task that sends something must be owned by a worker who has that tool.',
+        'Each task has one owner, a short title that names its output (e.g. "Write brief.md") and 1–3 concrete acceptance criteria a reviewer can check by reading the output.',
         'requiredTools lists the tools the task needs; the owner must have every one of them.',
-        'dependsOn lists the keys of tasks that must be done first.',
-        'costEstimateTokens is your estimate per task; the total must fit the budget left.',
+        'dependsOn lists the keys of tasks whose results this task uses; they must be done first.',
+        `costEstimateTokens is your estimate per task (usually 10000–50000); the total of all costEstimateTokens must be at most ${ceiling}, leaving the rest for reviews and rework.`,
       ]),
     ].join('\n'),
   };
@@ -89,14 +101,35 @@ export function plannerPrompt(agent: AgentView, goal: Goal, view: CompanyView): 
 export function workerSystem(agent: AgentView, tag: string): string {
   return [
     `You are ${agent.name}, a ${agent.role} at an AI company. You work on one task at a time.`,
-    'Do the work with your tools. Files live in a shared workspace; use paths relative to it.',
+    'Do the work with your tools. Files live in a shared workspace; use paths relative to it (notes/a.md, not workspace/notes/a.md). If a path does not exist, list the workspace by reading "." before you give up.',
     'When every acceptance criterion is met, call submit_work with a summary, a self-check of every criterion and the files you produced.',
     'If the task cannot be done, call report_blocked with the reason. Never claim a criterion is met when it is not.',
     untrustedRule(tag),
   ].join('\n');
 }
 
-export function workerTask(task: Task, goal: Goal | undefined, view: CompanyView, finalTools: string[], tag: string): string {
+/** Lessons shown per role: the most recent this many. */
+export const MAX_LESSONS = 5;
+
+/**
+ * Role memory: the CEO's notes for the role, plus lessons. A lesson is the
+ * last feedback (from the reviewer or the CEO) on a task by an agent of the
+ * same role that was then fixed and passed, so only reviewed work teaches.
+ * It is built from the company's record; the title and feedback are
+ * agent-written, so both are fenced as data.
+ */
+export function roleMemory(agent: AgentView, view: CompanyView, currentTaskId: string, notes: string | undefined, tag: string): string {
+  const sameRole = new Set(view.agents.filter((a) => a.role === agent.role).map((a) => a.id));
+  const lessons = view.tasks
+    .filter((t) => t.id !== currentTaskId && t.state === 'done' && sameRole.has(t.ownerId) && t.lastFeedback)
+    .slice(-MAX_LESSONS)
+    .map((t) => `A past task that was sent back, fixed and passed:\n${fence(tag, 'lesson', `Task: ${t.title}\nFeedback: ${t.lastFeedback}`)}`);
+  const parts = notesFor(notes);
+  if (lessons.length) parts.push(`Lessons from reviews of your role's past work:\n${lessons.join('\n')}`);
+  return parts.join('\n\n');
+}
+
+export function workerTask(task: Task, goal: Goal | undefined, view: CompanyView, finalTools: string[], tag: string, memory = ''): string {
   const deps = task.dependsOn
     .map((id) => view.tasks.find((t) => t.id === id))
     .filter((t): t is Task => !!t)
@@ -111,12 +144,19 @@ export function workerTask(task: Task, goal: Goal | undefined, view: CompanyView
   if (finalTools.length) {
     parts.push('', `To use ${finalTools.join(' or ')}, do not call it: put it in submit_work as finalAction. It runs only after review and CEO approval.`);
   }
-  if (task.lastFeedback) parts.push('', `Feedback on your last submission: ${task.lastFeedback}`);
+  if (memory) parts.push('', memory);
+  if (task.lastFeedback) parts.push('', `Feedback on your last submission:\n${fence(tag, 'review feedback', task.lastFeedback)}`);
   return parts.filter((p) => p !== '').join('\n');
 }
 
-export function feedbackMessage(feedback: string | null): string {
-  return `Your submission was sent back. Feedback: ${feedback ?? '(none given)'}\nFix it, then call submit_work again.`;
+/** Feedback is written by the reviewer (or the CEO): fenced with its own tag and rule, since a resumed conversation's tag is not kept. */
+export function feedbackMessage(feedback: string | null, tag: string = newFenceTag()): string {
+  return [
+    'Your submission was sent back. Feedback:',
+    fence(tag, 'review feedback', feedback ?? '(none given)'),
+    untrustedRule(tag),
+    'Fix it, then call submit_work again.',
+  ].join('\n');
 }
 
 // ───────────────────────── reviewer ─────────────────────────
@@ -129,6 +169,7 @@ export const VERDICT_SCHEMA: JsonSchema = {
     feedback: { type: 'string' },
   },
   required: ['passed', 'score', 'feedback'],
+  additionalProperties: false,
 };
 
 export function reviewerPrompt(
@@ -136,6 +177,7 @@ export function reviewerPrompt(
   task: Task,
   files: { path: string; content: string }[],
   tag: string = newFenceTag(),
+  notes?: string,
 ): { system: string; user: string } {
   const parts = [
     `Task: ${task.title}`,
@@ -154,6 +196,7 @@ export function reviewerPrompt(
       `You are ${agent.name}, an independent reviewer at an AI company. You check another agent's work against the task's acceptance criteria.`,
       'Pass only if every criterion is clearly met. If you fail it, say exactly what to fix. score is from 0 to 1.',
       untrustedRule(tag),
+      ...notesFor(notes),
       'Answer only with JSON matching the schema.',
     ].join('\n'),
     user: parts.join('\n'),

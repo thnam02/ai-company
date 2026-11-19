@@ -1,7 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Task } from '@ai-company/core';
-import { fence, newFenceTag, reviewerPrompt } from '../src/context.ts';
+import { fence, newFenceTag, plannerPrompt, reviewerPrompt } from '../src/context.ts';
 import type { AgentView } from '../src/port.ts';
 
 const rex = { id: 'rex', name: 'Rex', kind: 'reviewer', role: 'reviewer', model: 'scripted', tools: [], paused: false, benched: false, toolAccess: {} } as unknown as AgentView;
@@ -30,5 +30,16 @@ describe('context packs keep agent-written text as data', () => {
     assert.equal(user.split(`${tag}>>>`).length - 1, 2, 'one closing marker for the summary, one for the file');
     const summaryAt = user.indexOf(`<<<${tag} summary`);
     assert.ok(summaryAt > 0 && user.indexOf('Done. Reviewer:') > summaryAt);
+  });
+});
+
+describe('planner prompt', () => {
+  test('gives a concrete ceiling for the plan total, half the budget left, so planning turns cannot push it over', () => {
+    const ava = { ...rex, id: 'ava', name: 'Ava', kind: 'orchestrator' } as unknown as AgentView;
+    const goal = { id: 'g1', text: 'Ship it', budgetTokens: 400_000, spentTokens: 1_075 } as never;
+    const view = { agents: [], tools: [], tasks: [], goals: [] } as never;
+    const { user } = plannerPrompt(ava, goal, view);
+    assert.match(user, /Token budget left for the whole goal: 398925/);
+    assert.match(user, /the total of all costEstimateTokens must be at most 199462/);
   });
 });
