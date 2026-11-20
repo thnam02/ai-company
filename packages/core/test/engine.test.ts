@@ -415,6 +415,108 @@ describe('artifacts and the final-action execution record', () => {
   });
 });
 
+describe('tool results (M4)', () => {
+  const read = (key: string, path = 'README.md') => ({ tool: 'repo.read', input: { path }, idempotencyKey: key });
+
+  test('every allowed call gets one recorded result, and replay keeps it', () => {
+    const { engine, options } = makeCompany();
+    const { task: t } = startedTask(engine);
+    must(engine.requestToolCall(t.id, 'kai', read('k1')));
+    assert.deepEqual(engine.pendingToolCalls(), [{ taskId: t.id, tool: 'repo.read', idempotencyKey: 'k1' }]);
+
+    must(engine.recordToolResult(t.id, 'k1', { ok: true, detail: '# Readme', attempts: 1 }));
+    const last = engine.store.all().at(-1)!;
+    assert.equal(last.type, 'tool.executed');
+    assert.deepEqual(last.data, { tool: 'repo.read', idempotencyKey: 'k1', detail: '# Readme', attempts: 1 });
+    assert.deepEqual(engine.pendingToolCalls(), []);
+    assert.match((engine.recordToolResult(t.id, 'k1', { ok: true, detail: '' }) as any).error, /no open tool call/);
+
+    must(engine.requestToolCall(t.id, 'kai', read('k2', 'b')));
+    must(engine.recordToolResult(t.id, 'k2', { ok: false, detail: 'timed out' }));
+    assert.equal(engine.store.all().at(-1)!.type, 'tool.failed');
+
+    const rebuilt = WorkflowEngine.fromEvents(engine.store.all(), { policy: options.policy, now: options.now });
+    assert.deepEqual(rebuilt.pendingToolCalls(), []);
+    assert.deepEqual(rebuilt.listTasks(), engine.listTasks());
+  });
+
+  test('only a key the engine allowed for that task can get a result', () => {
+    const { engine } = makeCompany();
+    const { task: t } = startedTask(engine);
+    const { task: other } = startedTask(engine);
+    assert.match((engine.recordToolResult(t.id, 'never-allowed', { ok: true, detail: '' }) as any).error, /no open tool call/);
+    must(engine.requestToolCall(t.id, 'kai', read('k1')));
+    assert.match((engine.recordToolResult(other.id, 'k1', { ok: true, detail: '' }) as any).error, /no open tool call/);
+    assert.match((engine.recordToolResult('nope', 'k1', { ok: true, detail: '' }) as any).error, /unknown task/);
+    // A denied call has no result to record.
+    assert.equal(engine.requestToolCall(t.id, 'kai', { tool: 'prod.deploy', input: {}, idempotencyKey: 'k9' }).ok, false);
+    assert.match((engine.recordToolResult(t.id, 'k9', { ok: true, detail: '' }) as any).error, /no open tool call/);
+  });
+
+  test('a call that was running when the company stopped or the task moved on still records its result', () => {
+    const { engine } = makeCompany();
+    const { task: t } = startedTask(engine);
+    must(engine.requestToolCall(t.id, 'kai', read('k1')));
+    must(engine.pauseCompany());
+    must(engine.escalate(t.id, 'CEO stepped in'));
+    must(engine.recordToolResult(t.id, 'k1', { ok: true, detail: 'done' }));
+  });
+
+  test('an open call is pending whatever its task state, and its result goes to the agent that made it', () => {
+    const { engine } = makeCompany();
+    const { task: t } = startedTask(engine);
+    must(engine.requestToolCall(t.id, 'kai', read('k1')));
+    must(engine.escalate(t.id, 'stuck'));
+    must(engine.resolveEscalation(t.id, { kind: 'reassign', ownerId: 'omar' }));
+    assert.deepEqual(engine.pendingToolCalls(), [{ taskId: t.id, tool: 'repo.read', idempotencyKey: 'k1' }]);
+    must(engine.recordToolResult(t.id, 'k1', { ok: false, detail: 'interrupted' }));
+    assert.equal(engine.store.all().at(-1)!.agentId, 'kai');
+  });
+
+  test('calls allowed before M4 never expected a result, so an upgraded log has nothing pending', () => {
+    const { engine, options } = makeCompany();
+    const { task: t } = startedTask(engine);
+    must(engine.requestToolCall(t.id, 'kai', read('k1')));
+    const old = engine.store.all().map((e) => (e.type === 'tool.allowed' ? { ...e, data: { ...e.data, tracked: undefined } } : e));
+    const rebuilt = WorkflowEngine.fromEvents(old, { policy: options.policy, now: options.now });
+    assert.deepEqual(rebuilt.pendingToolCalls(), []);
+    assert.equal(rebuilt.requestToolCall(t.id, 'kai', read('k1')).ok && (rebuilt.requestToolCall(t.id, 'kai', read('k1')) as any).value.kind, 'duplicate', 'the key is still used');
+  });
+
+  test('a released action records when it starts, so a crash can tell "never ran" from "interrupted"', () => {
+    const { engine, options } = makeCompany();
+    const { task: t } = startedTask(engine, { ownerId: 'omar', requiredTools: ['email.send'] });
+    const action = { tool: 'email.send', input: {}, idempotencyKey: 'm1' };
+    must(engine.submitForReview(t.id, 'omar', { summary: 's', selfCheck: allMet(t.acceptanceCriteria), finalAction: action }));
+    must(engine.recordReview(t.id, 'rex', { passed: true, score: 1, feedback: '' }));
+    assert.match((engine.recordActionStarted(t.id, 'm1') as any).error, /not done/);
+    must(engine.decideApproval(t.id, { approved: true }));
+    assert.deepEqual(engine.pendingActions(), [{ taskId: t.id, action }], 'released, not started');
+    assert.match((engine.recordActionStarted(t.id, 'other') as any).error, /does not match/);
+    must(engine.recordActionStarted(t.id, 'm1'));
+    must(engine.recordActionStarted(t.id, 'm1'));
+    assert.equal(engine.store.all().filter((e) => e.type === 'action.started').length, 1, 'recorded once');
+    assert.deepEqual(engine.pendingActions(), [{ taskId: t.id, action, started: true }]);
+    const rebuilt = WorkflowEngine.fromEvents(engine.store.all(), { policy: options.policy, now: options.now });
+    assert.deepEqual(rebuilt.pendingActions(), engine.pendingActions());
+
+    // A release from before M4 has no start record: it may have run.
+    const old = engine.store.all().filter((e) => e.type !== 'action.started').map((e) => (e.type === 'task.done' ? { ...e, data: { ...e.data, startTracked: undefined } } : e));
+    assert.deepEqual(WorkflowEngine.fromEvents(old, { policy: options.policy, now: options.now }).pendingActions(), [{ taskId: t.id, action, started: true }]);
+  });
+
+  test('attempts on an action result survive replay', () => {
+    const { engine, options } = makeCompany();
+    const { task: t } = startedTask(engine, { ownerId: 'omar', requiredTools: ['email.send'] });
+    must(engine.submitForReview(t.id, 'omar', { summary: 's', selfCheck: allMet(t.acceptanceCriteria), finalAction: { tool: 'email.send', input: {}, idempotencyKey: 'm1' } }));
+    must(engine.recordReview(t.id, 'rex', { passed: true, score: 1, feedback: '' }));
+    must(engine.decideApproval(t.id, { approved: true }));
+    must(engine.recordActionResult(t.id, 'm1', { ok: true, detail: 'sent', attempts: 2 }));
+    const rebuilt = WorkflowEngine.fromEvents(engine.store.all(), { policy: options.policy, now: options.now });
+    assert.deepEqual(rebuilt.getTask(t.id)!.actionResult, { ok: true, detail: 'sent', attempts: 2 });
+  });
+});
+
 describe('agent runtime safety: kill switch, budgets and usage', () => {
   test('while the company is paused no review is recorded and no plan is accepted, so nothing is released', () => {
     const { engine } = makeCompany();

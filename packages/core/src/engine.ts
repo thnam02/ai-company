@@ -96,6 +96,12 @@ export class WorkflowEngine {
   private readonly goals = new Map<string, Goal>();
   private readonly tasks = new Map<string, Task>();
   private readonly usedKeys = new Set<string>();
+  /** Tasks whose release records when its action starts (M4 on); older releases count as started. */
+  private readonly startTracked = new Set<string>();
+  /** Tasks whose released action has started running. */
+  private readonly actionStarted = new Set<string>();
+  /** Allowed tool calls (from M4 on) with no recorded result yet, by idempotency key. */
+  private readonly openToolCalls = new Map<string, { taskId: string; agentId: string; tool: string }>();
   private readonly recentCalls = new Map<string, string[]>();
   private readonly escalationStreak = new Map<string, number>();
   private companyPaused = false;
@@ -152,12 +158,25 @@ export class WorkflowEngine {
    * the outbox. The server executes these and records the result; after a
    * crash, they are the actions that may or may not have run.
    */
-  pendingActions(): { taskId: string; action: ProposedAction }[] {
-    const pending: { taskId: string; action: ProposedAction }[] = [];
+  pendingActions(): { taskId: string; action: ProposedAction; started?: true }[] {
+    const pending: { taskId: string; action: ProposedAction; started?: true }[] = [];
     for (const t of this.tasks.values()) {
-      if (t.state === 'done' && t.finalAction && !t.actionResult) pending.push({ taskId: t.id, action: toAction(t.finalAction)! });
+      if (t.state !== 'done' || !t.finalAction || t.actionResult) continue;
+      // `started`: it may have run (a start was recorded, or the release predates start records).
+      const started = !this.startTracked.has(t.id) || this.actionStarted.has(t.id);
+      pending.push({ taskId: t.id, action: toAction(t.finalAction)!, ...(started ? { started: true as const } : {}) });
     }
     return pending;
+  }
+
+  /**
+   * Allowed tool calls with no recorded result, whatever their task's state.
+   * At boot these were interrupted by a crash; the gateway records them as
+   * failed (the worker redoes its turn from its checkpoint with new keys).
+   * Calls allowed before M4 never expected a result and are not included.
+   */
+  pendingToolCalls(): { taskId: string; tool: string; idempotencyKey: string }[] {
+    return [...this.openToolCalls].map(([idempotencyKey, call]) => ({ taskId: call.taskId, tool: call.tool, idempotencyKey }));
   }
 
   // ───────────────────────── agents & company ─────────────────────────
@@ -408,9 +427,26 @@ export class WorkflowEngine {
 
     this.emit('tool.allowed', {
       ...base,
-      data: { tool: call.tool, tier: decision.tier, idempotencyKey: call.idempotencyKey, signature },
+      // tracked: a result will be recorded for it (M4); older logs' calls have none.
+      data: { tool: call.tool, tier: decision.tier, idempotencyKey: call.idempotencyKey, signature, tracked: true },
     });
     return ok({ kind: 'allow', tier: decision.tier });
+  }
+
+  /**
+   * The gateway records what happened to an allowed tool call, once. Never
+   * called by agents. Allowed in any task or company state: a call that was
+   * running when the task moved on or the company stopped still happened.
+   */
+  recordToolResult(taskId: string, idempotencyKey: string, result: ActionResult): Result<true> {
+    const t = this.tasks.get(taskId);
+    if (!t) return fail(`unknown task "${taskId}"`);
+    const call = this.openToolCalls.get(idempotencyKey);
+    if (!call || call.taskId !== taskId) return fail(`no open tool call "${idempotencyKey}" for this task`);
+    const data = { tool: call.tool, idempotencyKey, detail: String(result.detail ?? ''), ...attemptsOf(result) };
+    // The agent that made the call, even if the task was reassigned since.
+    this.emit(result.ok ? 'tool.executed' : 'tool.failed', { goalId: t.goalId, taskId, agentId: call.agentId, data });
+    return ok(true);
   }
 
   /** Gate 2: the worker submits output plus a self-check against every acceptance criterion. */
@@ -481,7 +517,7 @@ export class WorkflowEngine {
       this.emit('approval.requested', { goalId: t.goalId, taskId, agentId: t.ownerId, data: { action: t.finalAction } });
       return ok({ state: t.state, execute: null });
     }
-    this.emit('task.done', { goalId: t.goalId, taskId, agentId: t.ownerId, data: { summary: t.summary, release: !!t.finalAction } });
+    this.emit('task.done', { goalId: t.goalId, taskId, agentId: t.ownerId, data: { summary: t.summary, release: !!t.finalAction, startTracked: true } });
     return ok({ state: t.state, execute: toAction(t.finalAction) });
   }
 
@@ -494,13 +530,28 @@ export class WorkflowEngine {
 
     if (decision.approved) {
       this.emit('approval.granted', { ...base, data: { note: decision.note ?? '' } });
-      this.emit('task.done', { ...base, data: { summary: t.summary, release: !!t.finalAction } });
+      this.emit('task.done', { ...base, data: { summary: t.summary, release: !!t.finalAction, startTracked: true } });
       return ok({ state: t.state, execute: toAction(t.finalAction) });
     }
     if (!decision.note?.trim()) return fail('a rejection needs a note so the agent can revise');
     this.emit('approval.rejected', { ...base, data: { note: decision.note.trim() } });
     if (t.reviewAttempts >= this.limits.maxReviewAttempts) this.escalateInternal(t, `rejected ${t.reviewAttempts} times`);
     return ok({ state: t.state, execute: null });
+  }
+
+  /**
+   * The gateway records that a released final action is about to run for the
+   * first time, so after a crash an action that never started (held by the
+   * kill switch, say) is run normally instead of being treated as interrupted.
+   */
+  recordActionStarted(taskId: string, idempotencyKey: string): Result<true> {
+    const t = this.tasks.get(taskId);
+    if (!t) return fail(`unknown task "${taskId}"`);
+    if (t.state !== 'done' || !t.finalAction) return fail('task is not done with a released final action');
+    if (t.finalAction.idempotencyKey !== idempotencyKey) return fail('idempotency key does not match the task\'s final action');
+    if (t.actionResult) return fail('action result already recorded');
+    if (!this.actionStarted.has(taskId)) this.emit('action.started', { goalId: t.goalId, taskId, agentId: t.ownerId, data: { idempotencyKey, tool: t.finalAction.tool } });
+    return ok(true);
   }
 
   /**
@@ -514,7 +565,7 @@ export class WorkflowEngine {
     if (t.state !== 'done' || !t.finalAction) return fail('task is not done with a released final action');
     if (t.finalAction.idempotencyKey !== idempotencyKey) return fail('idempotency key does not match the task\'s final action');
     if (t.actionResult) return fail('action result already recorded');
-    const data = { idempotencyKey, tool: t.finalAction.tool, detail: String(result.detail ?? '') };
+    const data = { idempotencyKey, tool: t.finalAction.tool, detail: String(result.detail ?? ''), ...attemptsOf(result) };
     this.emit(result.ok ? 'action.executed' : 'action.failed', { goalId: t.goalId, taskId, agentId: t.ownerId, data });
     return ok(true);
   }
@@ -697,7 +748,15 @@ export class WorkflowEngine {
       }
       case 'action.executed':
       case 'action.failed':
-        t!.actionResult = { ok: e.type === 'action.executed', detail: d.detail };
+        t!.actionResult = { ok: e.type === 'action.executed', detail: d.detail, ...attemptsOf(d) };
+        break;
+      case 'action.started':
+        this.actionStarted.add(t!.id);
+        break;
+      case 'tool.executed':
+      case 'tool.failed':
+        this.openToolCalls.delete(d.idempotencyKey);
+        touch();
         break;
       case 'task.assigned':
         this.move(t!, 'assigned');
@@ -731,6 +790,7 @@ export class WorkflowEngine {
         break;
       case 'tool.allowed': {
         this.usedKeys.add(d.idempotencyKey);
+        if (d.tracked) this.openToolCalls.set(d.idempotencyKey, { taskId: e.taskId!, agentId: e.agentId!, tool: d.tool });
         const list = this.recentCalls.get(e.taskId!) ?? [];
         list.push(d.signature);
         if (list.length > 10) list.shift();
@@ -773,6 +833,7 @@ export class WorkflowEngine {
       case 'task.done':
         this.move(t!, 'done');
         if (t!.finalAction) this.usedKeys.add(t!.finalAction.idempotencyKey);
+        if (d.startTracked) this.startTracked.add(t!.id);
         // Before M3a the server released actions without executing them, and
         // `task.done` had no release marker. Never run those on upgrade.
         if (t!.finalAction && !d.release && !t!.actionResult) {
@@ -793,6 +854,10 @@ export class WorkflowEngine {
         break;
     }
   }
+}
+
+function attemptsOf(r: { attempts?: unknown }): { attempts?: number } {
+  return Number.isInteger(r.attempts) && (r.attempts as number) > 0 ? { attempts: r.attempts as number } : {};
 }
 
 function toAction(fa: FinalAction | null): ProposedAction | null {

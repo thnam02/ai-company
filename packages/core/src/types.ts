@@ -81,10 +81,13 @@ export interface Goal {
   escalationReason: string | null;
 }
 
-/** Outcome of executing a released final action, recorded once. */
+/** Outcome of executing a tool call or a released final action, recorded once. */
 export interface ActionResult {
   ok: boolean;
+  /** Short, credential-free text: the tool's output or the reason it failed. */
   detail: string;
+  /** How many times the gateway tried it (retries after transient errors). */
+  attempts?: number;
 }
 
 /** An action that has a real-world effect, executed by the tool gateway. */
