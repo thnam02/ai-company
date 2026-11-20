@@ -20,6 +20,8 @@ function enginePort(engine: WorkflowEngine): GatewayEnginePort {
     pendingToolCalls: async () => engine.pendingToolCalls(),
     pendingActions: async () => engine.pendingActions(),
     isPaused: async () => engine.isCompanyPaused(),
+    awaitingChecks: async () => engine.awaitingChecks(),
+    recordChecks: async (taskId, submission, results, files) => engine.recordChecks(taskId, submission, results, files),
   };
 }
 
@@ -211,6 +213,64 @@ describe('tool gateway: work-time calls', () => {
     await gateway.call(task.id, 'kai', 'repo.read', { n: 3 });
     assert.deepEqual(sleeps, [50_000], 'waits until the first call leaves the window');
     assert.equal(read.runs.length, 3);
+  });
+});
+
+describe('tool gateway: automated checks (gate 3)', () => {
+  test('pending submissions are checked once; a failure sends the task back, a crash in a check never waves it through', async () => {
+    const seen: unknown[] = [];
+    let mode: 'ok' | 'fail' | 'crash' = 'fail';
+    const { engine, gateway } = setup([], {
+      checks: (submitted) => {
+        seen.push(submitted);
+        if (mode === 'crash') throw new Error('regex blew up');
+        return { results: [{ name: 'files.exist', ok: mode === 'ok', detail: mode === 'ok' ? 'found' : 'brief.md: does not exist' }], files: mode === 'ok' ? { 'brief.md': 'a'.repeat(64) } : ({} as Record<string, string>) };
+      },
+    });
+    const { task } = startedTask(engine);
+    const submit = () => must(engine.submitForReview(task.id, 'kai', { summary: 's', selfCheck: allMet(task.acceptanceCriteria), artifacts: ['brief.md'] }));
+
+    submit();
+    await gateway.runPendingChecks();
+    assert.deepEqual(seen, [{ artifacts: ['brief.md'], finalAction: null }]);
+    assert.equal(engine.getTask(task.id)!.state, 'working');
+    assert.match(engine.getTask(task.id)!.lastFeedback!, /files\.exist: brief\.md: does not exist/);
+
+    mode = 'crash';
+    submit();
+    await gateway.runPendingChecks();
+    assert.equal(engine.getTask(task.id)!.state, 'working');
+    assert.match(engine.getTask(task.id)!.lastFeedback!, /checks could not run: regex blew up/);
+
+    mode = 'ok';
+    submit();
+    await gateway.recover();
+    assert.equal(engine.getTask(task.id)!.state, 'review', 'boot runs checks a crash interrupted');
+    assert.deepEqual(engine.getTask(task.id)!.checkResults, [{ name: 'files.exist', ok: true, detail: 'found' }]);
+    await gateway.runPendingChecks();
+    assert.equal(seen.length, 3, 'a checked submission is not checked again');
+  });
+
+  test('a passing run that could not hash a file it was given fails: a review is held to the hashes', async () => {
+    const { engine, gateway } = setup([], { checks: () => ({ results: [{ name: 'files.exist', ok: true, detail: 'found' }], files: {} }) });
+    const { task } = startedTask(engine);
+    must(engine.submitForReview(task.id, 'kai', { summary: 's', selfCheck: allMet(task.acceptanceCriteria), artifacts: ['brief.md'] }));
+    await gateway.runPendingChecks();
+    assert.equal(engine.getTask(task.id)!.state, 'working');
+    assert.match(engine.getTask(task.id)!.lastFeedback!, /files\.hashed: could not be read for a hash: brief\.md/);
+  });
+
+  test('the kill switch holds checks: nothing moves while the company is stopped, and they run on resume', async () => {
+    let runs = 0;
+    const { engine, gateway } = setup([], { checks: () => (runs++, { results: [{ name: 'x', ok: false, detail: 'bad' }], files: {} }) });
+    const { task } = startedTask(engine);
+    must(engine.submitForReview(task.id, 'kai', { summary: 's', selfCheck: allMet(task.acceptanceCriteria) }));
+    must(engine.pauseCompany());
+    await gateway.runPendingChecks();
+    assert.deepEqual([runs, engine.getTask(task.id)!.state], [0, 'review']);
+    must(engine.resumeCompany());
+    await gateway.resume();
+    assert.deepEqual([runs, engine.getTask(task.id)!.state], [1, 'working']);
   });
 });
 

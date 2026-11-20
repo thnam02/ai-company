@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { fail, ok, type ActionResult, type ProposedAction, type Result, type ToolCallDecision } from '@ai-company/core';
+import { fail, ok, type ActionResult, type CheckResult, type ProposedAction, type Result, type TaskState, type ToolCallDecision } from '@ai-company/core';
+import type { Submitted } from './checks.ts';
 import { CredentialStore } from './credentials.ts';
 import { ToolInputError, TransientToolError, type ToolExecutor, type ToolRegistry } from './registry.ts';
 
@@ -39,12 +40,20 @@ export interface GatewayEnginePort {
   pendingActions(): Promise<{ taskId: string; action: ProposedAction; started?: boolean }[]>;
   /** The kill switch: nothing runs while it is on. */
   isPaused(): Promise<boolean>;
+  /** Submissions waiting for automated checks, and where their results go (gate 3). */
+  awaitingChecks(): Promise<({ taskId: string; submission: number } & Submitted)[]>;
+  recordChecks(taskId: string, submission: number, results: CheckResult[], files: Record<string, string>): Promise<Result<TaskState>>;
 }
 
 export interface GatewayOptions {
   engine: GatewayEnginePort;
   tools: ToolRegistry;
   credentials?: CredentialStore;
+  /**
+   * The automated checks of a submission (gate 3), with the sha256 of each
+   * file they read. Without it every submission passes with no checks.
+   */
+  checks?: (submitted: Submitted) => { results: CheckResult[]; files: Record<string, string> };
   /** Overrides of DEFAULT_TOOL_SETTINGS by tool name. */
   settings?: Record<string, Partial<ToolSettings>>;
   log?: (message: string) => void;
@@ -84,6 +93,7 @@ export class ToolGateway {
   private readonly engine: GatewayEnginePort;
   private readonly tools: ToolRegistry;
   private readonly credentials: CredentialStore;
+  private readonly checks: (submitted: Submitted) => { results: CheckResult[]; files: Record<string, string> };
   private readonly settings: Record<string, Partial<ToolSettings>>;
   private readonly log: (message: string) => void;
   private readonly newKey: () => string;
@@ -103,6 +113,7 @@ export class ToolGateway {
     this.engine = options.engine;
     this.tools = options.tools;
     this.credentials = options.credentials ?? new CredentialStore();
+    this.checks = options.checks ?? (() => ({ results: [], files: {} }));
     this.settings = options.settings ?? {};
     this.log = options.log ?? ((m) => console.error(`[gateway] ${m}`));
     this.newKey = options.newKey ?? (() => randomUUID());
@@ -214,6 +225,7 @@ export class ToolGateway {
    * before agents start.
    */
   async recover(): Promise<void> {
+    await this.runPendingChecks();
     for (const call of await this.engine.pendingToolCalls()) {
       const detail = 'interrupted by a restart before its result was recorded; it may or may not have run';
       const r = await this.engine.recordToolResult(call.taskId, call.idempotencyKey, { ok: false, detail });
@@ -232,11 +244,41 @@ export class ToolGateway {
     }
   }
 
+  /**
+   * Gate 3: runs the automated checks of every submission waiting for them
+   * and records the results, before any reviewer turn. Call after a submit
+   * is durable, and on boot for checks a crash interrupted.
+   */
+  async runPendingChecks(): Promise<void> {
+    // The kill switch stops checks too: no state moves while the company is stopped.
+    // Checks left waiting run on resume or on the stuck timer's next tick.
+    if (await this.engine.isPaused()) return;
+    for (const { taskId, submission, artifacts, finalAction } of await this.engine.awaitingChecks()) {
+      let results: CheckResult[];
+      let files: Record<string, string> = {};
+      try {
+        const checked = this.checks({ artifacts, finalAction });
+        results = checked.results.map((r) => ({ ...r, detail: this.clip(r.detail, MAX_DETAIL) }));
+        files = checked.files;
+        // A review is held to the hashes of what passed; a file the checks could not hash cannot pass.
+        const unhashed = [...new Set(artifacts)].filter((p) => !files[p]);
+        if (results.every((x) => x.ok) && unhashed.length) results.push({ name: 'files.hashed', ok: false, detail: `could not be read for a hash: ${unhashed.join(', ')}` });
+      } catch (err) {
+        // A broken check must not wave work through, nor leave it stuck in review.
+        results = [{ name: 'checks', ok: false, detail: `the checks could not run: ${this.text(err)}` }];
+      }
+      const r = await this.engine.recordChecks(taskId, submission, results, files);
+      if (!r.ok) this.log(`could not record checks for task ${taskId}: ${r.error}`);
+      else if (results.some((x) => !x.ok)) this.log(`checks failed for task ${taskId}: ${results.filter((x) => !x.ok).map((x) => x.name).join(', ')}`);
+    }
+  }
+
   /** After the kill switch is released: runs the final actions held while it was on. */
   async resume(): Promise<void> {
     // Let actions that are finishing (or just found themselves held) settle first.
     await Promise.allSettled([...this.actions.values()]);
     for (const { taskId, action } of await this.engine.pendingActions()) void this.release(taskId, action);
+    await this.runPendingChecks();
   }
 
   /** Refuses new calls and waits for running ones to record their results. */
