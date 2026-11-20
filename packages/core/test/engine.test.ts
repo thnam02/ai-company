@@ -153,7 +153,7 @@ describe('quality gates 2 and 4', () => {
     }
     const after = engine.getTask(t.id)!;
     assert.equal(after.state, 'escalated');
-    assert.match(after.escalationReason!, /failed review 3 times/);
+    assert.match(after.escalationReason!, /failed its checks or review 3 times/);
   });
 });
 
@@ -412,6 +412,169 @@ describe('artifacts and the final-action execution record', () => {
     must(engine.recordActionResult(t.id, 'mail-1', { ok: false, detail: 'interrupted; not retried' }));
     assert.equal(engine.store.all().at(-1)!.type, 'action.failed');
     assert.deepEqual(engine.pendingActions(), []);
+  });
+});
+
+describe('automated checks and rubric reviews (M5)', () => {
+  const strict = () => makeCompany({}, { strictReview: true });
+  const passing = [{ name: 'files.exist', ok: true, detail: 'brief.md' }];
+  const checks = (engine: WorkflowEngine, id: string, results: any, files?: Record<string, string>) => engine.recordChecks(id, engine.getTask(id)!.submissions, results, files);
+  const rubric = (criteria: string[], met = true) => criteria.map((criterion) => ({ criterion, met, ...(met ? {} : { note: 'missing' }) }));
+
+  test('checks are recorded once per submission; a pass keeps the task in review for the reviewer', () => {
+    const { engine, options } = strict();
+    const { task: t } = startedTask(engine);
+    assert.match((checks(engine, t.id, passing) as any).error, /not in review/);
+    must(engine.submitForReview(t.id, 'kai', { summary: 'Built', selfCheck: allMet(t.acceptanceCriteria) }));
+    assert.equal(engine.getTask(t.id)!.checkResults, null);
+    for (const bad of [[{ name: '', ok: true, detail: '' }], [{ name: 'x', ok: 'yes', detail: '' }], 'nope'] as any[]) {
+      assert.match((checks(engine, t.id, bad) as any).error, /results of \{ name, ok, detail \}/);
+    }
+    assert.equal(must(checks(engine, t.id, passing)), 'review');
+    assert.deepEqual(engine.getTask(t.id)!.checkResults, passing);
+    assert.equal(engine.store.all().at(-1)!.type, 'checks.passed');
+    assert.match((checks(engine, t.id, passing) as any).error, /already recorded/);
+    const rebuilt = WorkflowEngine.fromEvents(engine.store.all(), { policy: options.policy, now: options.now });
+    assert.deepEqual(rebuilt.listTasks(), engine.listTasks());
+  });
+
+  test('a failed check sends the task back with feedback naming each failure, and counts as a review attempt', () => {
+    const { engine, options } = strict();
+    const { task: t } = startedTask(engine);
+    const failing = [...passing, { name: 'content.links', ok: false, detail: 'notes/missing.md does not exist' }];
+    for (let i = 1; i <= 3; i++) {
+      must(engine.submitForReview(t.id, 'kai', { summary: 'Built', selfCheck: allMet(t.acceptanceCriteria) }));
+      must(checks(engine, t.id, failing));
+      const now = engine.getTask(t.id)!;
+      if (i < 3) {
+        assert.equal(now.state, 'working');
+        assert.equal(now.reviewAttempts, i);
+        assert.equal(now.lastFeedback, 'Automated checks failed:\n- content.links: notes/missing.md does not exist');
+      }
+    }
+    assert.equal(engine.getTask(t.id)!.state, 'escalated');
+    assert.match(engine.getTask(t.id)!.escalationReason!, /failed its checks or review 3 times/);
+    // Failed check runs replay to the same state, attempts and feedback.
+    const rebuilt = WorkflowEngine.fromEvents(engine.store.all(), { policy: options.policy, now: options.now });
+    assert.deepEqual(rebuilt.listTasks(), engine.listTasks());
+  });
+
+  test('checks name their submission and the files they read; stale results and bad hashes are refused', () => {
+    const { engine, options } = strict();
+    const { task: t } = startedTask(engine);
+    const hash = 'a'.repeat(64);
+    must(engine.submitForReview(t.id, 'kai', { summary: 'Built', selfCheck: allMet(t.acceptanceCriteria), artifacts: ['app.ts'] }));
+    const [pending] = engine.awaitingChecks();
+    assert.equal(pending.submission, 1);
+    assert.match((engine.recordChecks(t.id, 0, passing) as any).error, /for submission 0; the task is on submission 1/);
+    for (const bad of [{ 'other.ts': hash }, { 'app.ts': 'abc' }, ['app.ts']] as any[]) {
+      assert.match((checks(engine, t.id, passing, bad) as any).error, /artifact paths to sha256/);
+    }
+    must(checks(engine, t.id, passing, { 'app.ts': hash }));
+    assert.deepEqual(engine.checkedFiles(t.id), { artifacts: ['app.ts'], files: { 'app.ts': hash } });
+    assert.equal(engine.store.all().at(-1)!.agentId, undefined, 'checks are the gateway, not an agent');
+
+    // Files changed after the checks: the results are dropped and the work waits for new checks.
+    must(engine.resetChecks(t.id, 'app.ts changed'));
+    assert.equal(engine.getTask(t.id)!.checkResults, null);
+    assert.equal(engine.checkedFiles(t.id), null);
+    assert.equal(engine.awaitingChecks()[0].submission, 1);
+    assert.match((engine.resetChecks(t.id, 'again') as any).error, /no recorded checks/);
+    must(checks(engine, t.id, passing, { 'app.ts': 'b'.repeat(64) }));
+    const rebuilt = WorkflowEngine.fromEvents(engine.store.all(), { policy: options.policy, now: options.now });
+    assert.deepEqual(rebuilt.listTasks(), engine.listTasks());
+  });
+
+  test('the rubric sets the score; a malformed note is refused, not thrown', () => {
+    const { engine } = strict();
+    const { task: t } = startedTask(engine);
+    const [a, b] = t.acceptanceCriteria;
+    must(engine.submitForReview(t.id, 'kai', { summary: 'Built', selfCheck: allMet(t.acceptanceCriteria) }));
+    must(checks(engine, t.id, passing));
+    for (const note of [5, 'x'.repeat(2_001)] as any[]) {
+      const r = engine.recordReview(t.id, 'rex', { passed: false, score: 0, feedback: 'f', rubric: [{ criterion: a, met: true }, { criterion: b, met: false, note }] });
+      assert.match((r as any).error, /note of at most 2000 characters/);
+    }
+    must(engine.recordReview(t.id, 'rex', { passed: false, score: 0.99, feedback: 'f', rubric: [{ criterion: a, met: true }, { criterion: b, met: false, note: 'no tests' }] }));
+    assert.equal(engine.store.all().at(-1)!.data!.score, 0.5, "the reviewer's own score is not kept");
+  });
+
+  test('a plan with blank or repeated criteria is refused: each criterion must be judged once', () => {
+    const { engine } = strict();
+    const goal = must(engine.createGoal('g', 100_000));
+    const task = { key: 'a', title: 'A', ownerId: 'kai', requiredTools: [], dependsOn: [], costEstimateTokens: 1_000 };
+    const r = engine.submitPlan(goal.id, 'ava', [{ ...task, acceptanceCriteria: ['Covers pricing', ' covers PRICING ', ''] }]);
+    assert.match((r as any).error, /repeats the acceptance criterion "covers PRICING"/);
+    assert.match((r as any).error, /blank acceptance criterion/);
+  });
+
+  test('in strict mode a review needs passed checks and a rubric that covers every criterion and agrees with the verdict', () => {
+    const { engine } = strict();
+    const { task: t } = startedTask(engine);
+    const criteria = t.acceptanceCriteria;
+    must(engine.submitForReview(t.id, 'kai', { summary: 'Built', selfCheck: allMet(criteria) }));
+    const verdict = { passed: true, score: 1, feedback: '', rubric: rubric(criteria) };
+    assert.match((engine.recordReview(t.id, 'rex', verdict) as any).error, /automated checks have not passed/);
+    must(checks(engine, t.id, passing));
+
+    assert.match((engine.recordReview(t.id, 'rex', { passed: true, score: 1, feedback: '' }) as any).error, /needs a rubric/);
+    assert.match((engine.recordReview(t.id, 'rex', { ...verdict, rubric: rubric(criteria).slice(1) }) as any).error, /does not cover: Page renders/);
+    assert.match((engine.recordReview(t.id, 'rex', { ...verdict, rubric: [...rubric(criteria), { criterion: 'Extra', met: true }] }) as any).error, /not an acceptance criterion: Extra/);
+    const mixed = [{ criterion: criteria[0], met: true }, { criterion: criteria[1], met: false, note: 'no tests' }];
+    assert.match((engine.recordReview(t.id, 'rex', { ...verdict, rubric: mixed }) as any).error, /passes but a criterion is not met/);
+    assert.match((engine.recordReview(t.id, 'rex', { passed: false, score: 0.5, feedback: 'Fix', rubric: rubric(criteria) }) as any).error, /fails but every criterion is met/);
+    assert.match((engine.recordReview(t.id, 'rex', { passed: false, score: 0.5, feedback: 'Fix', rubric: [mixed[0], { criterion: criteria[1], met: false }] }) as any).error, /needs a note/);
+
+    must(engine.recordReview(t.id, 'rex', { passed: false, score: 0.5, feedback: 'Add tests', rubric: mixed }));
+    const failed = engine.store.all().at(-1)!;
+    assert.equal(failed.type, 'review.failed');
+    assert.deepEqual(failed.data!.rubric, mixed);
+
+    // The next submission needs its own checks.
+    must(engine.submitForReview(t.id, 'kai', { summary: 'With tests', selfCheck: allMet(criteria) }));
+    assert.match((engine.recordReview(t.id, 'rex', verdict) as any).error, /automated checks have not passed/);
+    must(checks(engine, t.id, passing));
+    must(engine.recordReview(t.id, 'rex', verdict));
+    assert.equal(engine.getTask(t.id)!.state, 'done');
+  });
+
+  test('outside strict mode reviews work as before, and a rubric given is still checked', () => {
+    const { engine } = makeCompany();
+    const { task: t } = startedTask(engine);
+    must(engine.submitForReview(t.id, 'kai', { summary: 'Built', selfCheck: allMet(t.acceptanceCriteria) }));
+    assert.match((engine.recordReview(t.id, 'rex', { passed: true, score: 1, feedback: '', rubric: [] }) as any).error, /does not cover/);
+    must(engine.recordReview(t.id, 'rex', { passed: true, score: 1, feedback: '' }));
+  });
+
+  test('older logs have no check fields; replay fills them in and counts submissions from the log', () => {
+    const { engine, options } = makeCompany({}, { strictReview: true });
+    const { task: t } = startedTask(engine);
+    must(engine.submitForReview(t.id, 'kai', { summary: 'Built', selfCheck: allMet(t.acceptanceCriteria) }));
+    const old = engine.store.all().map((e) =>
+      e.type === 'plan.accepted' ? { ...e, data: { tasks: e.data!.tasks.map(({ checkResults: _c, checkedFiles: _f, submissions: _s, checkResets: _r, ...rest }: any) => rest) } } : e,
+    );
+    const rebuilt = WorkflowEngine.fromEvents(old, { policy: options.policy, now: options.now, strictReview: true });
+    const task = rebuilt.getTask(t.id)!;
+    assert.deepEqual([task.checkResults, task.checkedFiles, task.submissions, task.checkResets], [null, null, 1, 0]);
+    assert.equal(rebuilt.awaitingChecks()[0].submission, 1);
+    must(rebuilt.recordChecks(t.id, 1, []));
+  });
+
+  test('files that keep changing during review escalate instead of resetting forever', () => {
+    const { engine, options } = strict();
+    const { task: t } = startedTask(engine);
+    const hash = (c: string) => c.repeat(64);
+    must(engine.submitForReview(t.id, 'kai', { summary: 'Built', selfCheck: allMet(t.acceptanceCriteria), artifacts: ['app.ts'] }));
+    assert.match((checks(engine, t.id, passing) as any).error, /passed without a hash of: app\.ts/, 'strict: a pass names the content that passed');
+    for (const c of ['a', 'b', 'c']) {
+      must(checks(engine, t.id, passing, { 'app.ts': hash(c) }));
+      must(engine.resetChecks(t.id, 'app.ts changed'));
+    }
+    assert.equal(engine.getTask(t.id)!.state, 'escalated');
+    assert.match(engine.getTask(t.id)!.escalationReason!, /files kept changing during review \(3 times\)/);
+    assert.equal(engine.getTask(t.id)!.reviewAttempts, 0, 'resets are not failed reviews');
+    const rebuilt = WorkflowEngine.fromEvents(engine.store.all(), { policy: options.policy, now: options.now });
+    assert.deepEqual(rebuilt.listTasks(), engine.listTasks());
   });
 });
 

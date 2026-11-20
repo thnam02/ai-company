@@ -103,6 +103,13 @@ export interface FinalAction extends ProposedAction {
   needsApproval: boolean;
 }
 
+/** One deterministic check of a submission (M5), run by the gateway before review. */
+export interface CheckResult {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
 export interface Task {
   id: string;
   goalId: string;
@@ -126,6 +133,14 @@ export interface Task {
   actionResult: ActionResult | null;
   lastFeedback: string | null;
   escalationReason: string | null;
+  /** Automated checks of the current submission; null until they run. */
+  checkResults: CheckResult[] | null;
+  /** sha256 of each artifact as the checks read it; a review is of exactly these files. */
+  checkedFiles: Record<string, string> | null;
+  /** How many times the work was submitted; names the submission a check run is for. */
+  submissions: number;
+  /** Times this submission's files changed during review and were checked again. */
+  checkResets: number;
 }
 
 /** Every state change is one of these, appended to the event log. */

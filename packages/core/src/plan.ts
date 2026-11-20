@@ -34,8 +34,18 @@ export function validatePlan(plan: readonly PlanTask[], ctx: PlanContext): strin
     keys.add(t.key);
 
     if (!t.title?.trim()) errors.push(`${label} has no title`);
-    if (!Array.isArray(t.acceptanceCriteria) || t.acceptanceCriteria.filter((c: string) => c?.trim()).length === 0) {
+    if (!Array.isArray(t.acceptanceCriteria) || t.acceptanceCriteria.filter((c: string) => typeof c === 'string' && c.trim()).length === 0) {
       errors.push(`${label} has no acceptance criteria`);
+    } else {
+      // A reviewer judges each criterion once; blank or repeated ones cannot be judged.
+      if (t.acceptanceCriteria.some((c: unknown) => typeof c !== 'string' || !c.trim())) errors.push(`${label} has a blank acceptance criterion`);
+      const seen = new Set<string>();
+      for (const c of t.acceptanceCriteria) {
+        // The same normalisation the reviewer's rubric matching uses.
+        const k = typeof c === 'string' ? c.trim().toLowerCase().replace(/\s+/g, ' ') : '';
+        if (k && seen.has(k)) errors.push(`${label} repeats the acceptance criterion "${c.trim()}"`);
+        seen.add(k);
+      }
     }
     if (!Number.isFinite(t.costEstimateTokens) || t.costEstimateTokens <= 0) {
       errors.push(`${label} needs a positive cost estimate`);

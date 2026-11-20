@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type {
   ActionResult,
   AgentProfile,
+  CheckResult,
   EngineEvent,
   FinalAction,
   Goal,
@@ -32,6 +33,9 @@ export const DEFAULT_LIMITS: Limits = {
 };
 
 const MAX_ARTIFACTS = 20;
+const MAX_CHECKS = 50;
+const MAX_RUBRIC_NOTE = 2_000;
+const SHA256 = /^[0-9a-f]{64}$/;
 
 export interface EngineOptions {
   policy: PolicyEngine;
@@ -40,6 +44,12 @@ export interface EngineOptions {
   limits?: Partial<Limits>;
   now?: () => number;
   newId?: () => string;
+  /**
+   * Gates 3 and 4 in full (M5): a review is accepted only after the
+   * submission's automated checks passed, and only with a rubric that judges
+   * every acceptance criterion. The server always sets it.
+   */
+  strictReview?: boolean;
 }
 
 export interface SelfCheckItem {
@@ -58,10 +68,20 @@ export interface Submission {
   finalAction?: ProposedAction;
 }
 
+/** The reviewer's judgement of one acceptance criterion. */
+export interface RubricItem {
+  criterion: string;
+  met: boolean;
+  /** Evidence; required when the criterion is not met. */
+  note?: string;
+}
+
 export interface ReviewVerdict {
   passed: boolean;
   score: number;
   feedback: string;
+  /** One item per acceptance criterion. `passed` must equal "every item met". Required with strictReview. */
+  rubric?: RubricItem[];
 }
 
 export type ToolCallDecision = { kind: 'allow'; tier: RiskTier } | { kind: 'duplicate' };
@@ -90,6 +110,7 @@ export class WorkflowEngine {
   readonly policy: PolicyEngine;
   readonly limits: Limits;
 
+  private readonly strictReview: boolean;
   private readonly now: () => number;
   private readonly newId: () => string;
   private readonly agents = new Map<string, AgentProfile>();
@@ -111,6 +132,7 @@ export class WorkflowEngine {
     this.store = options.store ?? new InMemoryEventStore();
     this.limits = { ...DEFAULT_LIMITS, ...options.limits };
     this.now = options.now ?? Date.now;
+    this.strictReview = options.strictReview ?? false;
     this.newId = options.newId ?? (() => randomUUID());
     for (const event of this.store.all()) this.apply(event);
   }
@@ -177,6 +199,24 @@ export class WorkflowEngine {
    */
   pendingToolCalls(): { taskId: string; tool: string; idempotencyKey: string }[] {
     return [...this.openToolCalls].map(([idempotencyKey, call]) => ({ taskId: call.taskId, tool: call.tool, idempotencyKey }));
+  }
+
+  /**
+   * Submissions waiting for their automated checks (gate 3): tasks in review
+   * with none recorded. `submission` goes back with the results, so they are
+   * never taken for a later submission. Copies, safe to read after an await.
+   */
+  awaitingChecks(): { taskId: string; submission: number; artifacts: string[]; finalAction: ProposedAction | null }[] {
+    return [...this.tasks.values()]
+      .filter((t) => t.state === 'review' && !t.checkResults)
+      .map((t) => ({ taskId: t.id, submission: t.submissions, artifacts: [...t.artifacts], finalAction: structuredClone(toAction(t.finalAction)) }));
+  }
+
+  /** The files a task's passed checks read, with their sha256, while it waits for review. */
+  checkedFiles(taskId: string): { artifacts: string[]; files: Record<string, string> } | null {
+    const t = this.tasks.get(taskId);
+    if (!t || t.state !== 'review' || !t.checkResults || !t.checkedFiles) return null;
+    return { artifacts: [...t.artifacts], files: { ...t.checkedFiles } };
   }
 
   // ───────────────────────── agents & company ─────────────────────────
@@ -313,6 +353,10 @@ export class WorkflowEngine {
       actionResult: null,
       lastFeedback: null,
       escalationReason: null,
+      checkResults: null,
+      checkedFiles: null,
+      submissions: 0,
+      checkResets: 0,
     }));
 
     this.emit('plan.accepted', { goalId, agentId: orchestratorId, data: { tasks } });
@@ -491,6 +535,64 @@ export class WorkflowEngine {
     return ok(t.state);
   }
 
+  /**
+   * Gate 3: the gateway's automated checks of a submission, once per
+   * submission, before any review. A failure sends the task back with the
+   * failures as feedback and counts as a failed review attempt.
+   */
+  recordChecks(taskId: string, submission: number, results: CheckResult[], files: Record<string, string> = {}): Result<TaskState> {
+    const t = this.tasks.get(taskId);
+    if (!t) return fail(`unknown task "${taskId}"`);
+    if (t.state !== 'review') return fail(`task is ${t.state}, not in review`);
+    if (submission !== t.submissions) return fail(`these checks are for submission ${submission}; the task is on submission ${t.submissions}`);
+    if (t.checkResults) return fail('checks already recorded for this submission');
+    if (
+      !files ||
+      typeof files !== 'object' ||
+      Array.isArray(files) ||
+      !Object.entries(files).every(([path, hash]) => t.artifacts.includes(path) && typeof hash === 'string' && SHA256.test(hash))
+    ) {
+      return fail('checked files must map artifact paths to sha256 hashes');
+    }
+    if (
+      !Array.isArray(results) ||
+      results.length > MAX_CHECKS ||
+      !results.every((r) => r && typeof r.name === 'string' && r.name.trim() !== '' && typeof r.ok === 'boolean' && typeof r.detail === 'string')
+    ) {
+      return fail(`checks must be up to ${MAX_CHECKS} results of { name, ok, detail }`);
+    }
+    const clean = results.map((r) => ({ name: r.name.trim(), ok: r.ok, detail: r.detail.slice(0, 1_000) }));
+    // Run by the gateway, not by an agent: the events carry no agent.
+    const base = { goalId: t.goalId, taskId };
+    const failed = clean.filter((r) => !r.ok);
+    // A pass must say which content passed: the review is held to these hashes.
+    const unhashed = this.strictReview ? [...new Set(t.artifacts)].filter((p) => !files[p]) : [];
+    if (!failed.length && unhashed.length) return fail(`checks passed without a hash of: ${unhashed.join(', ')}`);
+    if (!failed.length) {
+      this.emit('checks.passed', { ...base, data: { submission, results: clean, files: { ...files } } });
+      return ok(t.state);
+    }
+    const feedback = ['Automated checks failed:', ...failed.map((r) => `- ${r.name}: ${r.detail}`)].join('\n');
+    this.emit('checks.failed', { ...base, data: { submission, results: clean, feedback } });
+    if (t.reviewAttempts >= this.limits.maxReviewAttempts) this.escalateInternal(t, `failed its checks or review ${t.reviewAttempts} times`);
+    return ok(t.state);
+  }
+
+  /**
+   * The files changed after their checks passed (another worker shares the
+   * workspace): drop the results so the gateway checks them again before
+   * any review. Not a failed attempt.
+   */
+  resetChecks(taskId: string, reason: string): Result<TaskState> {
+    const t = this.tasks.get(taskId);
+    if (!t) return fail(`unknown task "${taskId}"`);
+    if (t.state !== 'review' || !t.checkResults) return fail('no recorded checks to reset');
+    this.emit('checks.reset', { goalId: t.goalId, taskId, data: { submission: t.submissions, reason: String(reason).slice(0, 1_000) } });
+    // Something keeps rewriting the files: a review could never settle, so the CEO decides.
+    if (t.checkResets >= this.limits.maxReviewAttempts) this.escalateInternal(t, `its files kept changing during review (${t.checkResets} times)`);
+    return ok(t.state);
+  }
+
   /** Gate 4: an independent reviewer scores the output. Never the author. */
   recordReview(taskId: string, reviewerId: string, verdict: ReviewVerdict): Result<Outcome> {
     const t = this.tasks.get(taskId);
@@ -501,24 +603,52 @@ export class WorkflowEngine {
     if (!reviewer || reviewer.kind !== 'reviewer') return fail('reviews must come from a reviewer agent');
     if (reviewerId === t.ownerId) return fail('an agent cannot review its own work');
     if (reviewer.paused || reviewer.benched) return fail(`${reviewer.name} is unavailable`);
+    if (this.strictReview && !t.checkResults) return fail('automated checks have not passed for this submission yet');
+    const rubricError = this.checkRubric(t, verdict);
+    if (rubricError) return fail(rubricError);
     const base = { goalId: t.goalId, taskId, agentId: reviewerId };
+    const rubric = verdict.rubric ? { rubric: verdict.rubric.map((r) => ({ criterion: r.criterion, met: r.met, ...(r.note?.trim() ? { note: r.note.trim() } : {}) })) } : {};
+    // With a rubric, the score is the share of criteria met, not the reviewer's say.
+    const score = verdict.rubric?.length ? Math.round((100 * verdict.rubric.filter((r) => r.met).length) / verdict.rubric.length) / 100 : verdict.score;
 
     if (!verdict.passed) {
       if (!verdict.feedback?.trim()) return fail('a failed review needs feedback');
-      this.emit('review.failed', { ...base, data: { score: verdict.score, feedback: verdict.feedback.trim() } });
+      this.emit('review.failed', { ...base, data: { score, feedback: verdict.feedback.trim(), ...rubric } });
       if (t.reviewAttempts >= this.limits.maxReviewAttempts) {
-        this.escalateInternal(t, `failed review ${t.reviewAttempts} times`);
+        this.escalateInternal(t, `failed its checks or review ${t.reviewAttempts} times`);
       }
       return ok({ state: t.state, execute: null });
     }
 
-    this.emit('review.passed', { ...base, data: { score: verdict.score, feedback: verdict.feedback ?? '' } });
+    this.emit('review.passed', { ...base, data: { score, feedback: verdict.feedback ?? '', ...rubric } });
     if (t.finalAction?.needsApproval) {
       this.emit('approval.requested', { goalId: t.goalId, taskId, agentId: t.ownerId, data: { action: t.finalAction } });
       return ok({ state: t.state, execute: null });
     }
     this.emit('task.done', { goalId: t.goalId, taskId, agentId: t.ownerId, data: { summary: t.summary, release: !!t.finalAction, startTracked: true } });
     return ok({ state: t.state, execute: toAction(t.finalAction) });
+  }
+
+  /** A rubric must judge each acceptance criterion exactly once and agree with the verdict. */
+  private checkRubric(t: Task, verdict: ReviewVerdict): string | null {
+    if (verdict.rubric === undefined) return this.strictReview ? 'a review needs a rubric: one item per acceptance criterion' : null;
+    const items = verdict.rubric;
+    if (
+      !Array.isArray(items) ||
+      !items.every((r) => r && typeof r.criterion === 'string' && typeof r.met === 'boolean' && (r.note === undefined || (typeof r.note === 'string' && r.note.length <= MAX_RUBRIC_NOTE)))
+    ) {
+      return `rubric items must be { criterion, met, note? } with a note of at most ${MAX_RUBRIC_NOTE} characters`;
+    }
+    const extra = items.filter((r) => !t.acceptanceCriteria.includes(r.criterion)).map((r) => r.criterion);
+    if (extra.length) return `rubric item is not an acceptance criterion: ${extra.join('; ')}`;
+    const missing = t.acceptanceCriteria.filter((c) => items.filter((r) => r.criterion === c).length !== 1);
+    if (missing.length) return `rubric does not cover: ${missing.join('; ')} (one item each)`;
+    const allMet = items.every((r) => r.met);
+    if (verdict.passed && !allMet) return 'the verdict passes but a criterion is not met';
+    if (!verdict.passed && allMet) return 'the verdict fails but every criterion is met';
+    const bare = items.filter((r) => !r.met && !r.note?.trim()).map((r) => r.criterion);
+    if (bare.length) return `an unmet criterion needs a note saying what is missing: ${bare.join('; ')}`;
+    return null;
   }
 
   /** Gate 5: the CEO approves or rejects a tier-3 final action. */
@@ -740,6 +870,10 @@ export class WorkflowEngine {
           // Older logs have no artifacts or action results.
           copy.artifacts ??= [];
           copy.actionResult ??= null;
+          copy.checkResults ??= null;
+          copy.checkedFiles ??= null;
+          copy.submissions ??= 0;
+          copy.checkResets ??= 0;
           this.tasks.set(copy.id, copy);
         }
         const goal = this.goals.get(e.goalId!);
@@ -762,7 +896,7 @@ export class WorkflowEngine {
         this.move(t!, 'assigned');
         t!.ownerId = d.ownerId;
         if (d.reset) {
-          Object.assign(t!, { steps: 0, tokens: 0, startedAt: null, lastActivityAt: null, reviewAttempts: 0, summary: null, artifacts: [], finalAction: null, actionResult: null, escalationReason: null });
+          Object.assign(t!, { steps: 0, tokens: 0, startedAt: null, lastActivityAt: null, reviewAttempts: 0, summary: null, artifacts: [], finalAction: null, actionResult: null, escalationReason: null, checkResults: null, checkedFiles: null });
           this.recentCalls.delete(t!.id);
         }
         break;
@@ -808,6 +942,27 @@ export class WorkflowEngine {
         t!.summary = d.summary;
         t!.artifacts = [...(d.artifacts ?? [])];
         t!.finalAction = d.finalAction ?? null;
+        t!.checkResults = null;
+        t!.checkedFiles = null;
+        t!.submissions += 1;
+        t!.checkResets = 0;
+        touch();
+        break;
+      case 'checks.passed':
+        t!.checkResults = structuredClone(d.results);
+        t!.checkedFiles = { ...(d.files ?? {}) };
+        touch();
+        break;
+      case 'checks.reset':
+        t!.checkResults = null;
+        t!.checkedFiles = null;
+        t!.checkResets += 1;
+        break;
+      case 'checks.failed':
+        t!.checkResults = structuredClone(d.results);
+        t!.reviewAttempts += 1;
+        t!.lastFeedback = d.feedback;
+        this.move(t!, 'working');
         touch();
         break;
       case 'review.failed':
