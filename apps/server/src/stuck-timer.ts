@@ -9,6 +9,8 @@ export interface StuckTimerOptions {
   engine: WorkflowEngine;
   intervalMs?: number;
   log?: (message: string) => void;
+  /** Also run on each tick: automated checks that could not be recorded are retried. */
+  alsoEachTick?: () => Promise<void>;
 }
 
 /** Calls `engine.checkStuck()` on a timer. Returns a function that stops it. */
@@ -20,8 +22,9 @@ export function startStuckTimer(options: StuckTimerOptions): () => void {
     busy = true;
     options
       .run(() => options.engine.checkStuck())
-      .then((escalated) => {
+      .then(async (escalated) => {
         if (escalated.length) log(`stuck check escalated ${escalated.length} task(s): ${escalated.join(', ')}`);
+        await options.alsoEachTick?.();
       })
       .catch(() => {
         // A store failure is already fatal through the command queue.

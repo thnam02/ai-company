@@ -47,7 +47,7 @@ export async function liveTeam(options: { ollamaUrl: string; model: string; limi
   cpSync(NOTES, join(workspaceDir, 'notes'), { recursive: true });
 
   const store = new MemoryDurableEventStore();
-  const engine = new WorkflowEngine({ policy: buildPolicy(config), store, limits: config.limits });
+  const engine = new WorkflowEngine({ policy: buildPolicy(config), store, limits: config.limits, strictReview: true });
   const boot = bootstrapAgents(engine, config);
   if (!boot.ok) throw new Error(boot.error);
   const workspace = new Workspace(workspaceDir);
@@ -57,7 +57,7 @@ export async function liveTeam(options: { ollamaUrl: string; model: string; limi
     logs.push(m);
     if (process.env.LIVE_VERBOSE) console.error(`[live] ${m}`);
   };
-  const server = createCompanyServer({ engine, store, ceoToken: 'live-team-token-0123456789', tools, log, onFatal: (e) => log(`FATAL ${e.message}`) });
+  const server = createCompanyServer({ engine, store, ceoToken: 'live-team-token-0123456789', tools, workspace, checks: config.checks, log, onFatal: (e) => log(`FATAL ${e.message}`) });
   await new Promise<void>((resolve) => server.http.listen(0, '127.0.0.1', resolve));
   const { port } = server.http.address() as AddressInfo;
 

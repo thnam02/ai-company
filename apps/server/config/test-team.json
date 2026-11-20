@@ -6,6 +6,7 @@
   ],
   "autoApproveTier2": [],
   "limits": {},
+  "checks": { "content": { "minWords": 50, "maxWords": 1500 }, "email": { "allowedRecipients": ["@example.com"], "maxBodyWords": 400 } },
   "roles": {
     "chief-of-staff": "Documents built from notes (briefs, summaries) go to the researcher; emails and other copy go to the writer. Only a task that sends something lists email.send in requiredTools.",
     "researcher": "You turn notes into documents. Read every file the task points to with files_read, write the result with files_write, then submit_work listing the file in artifacts. Use only facts from the notes.",

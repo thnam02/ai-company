@@ -94,7 +94,7 @@ describe(`live: the test team on ${MODEL}`, { skip: OLLAMA_URL ? false : 'set OL
     }
     const reason = t.engine.getTask(task.id)!.escalationReason!;
     // Either Rex failed it three times, or Kai reported it blocked; both hand it to the CEO.
-    assert.match(reason, /failed review 3 times|^Kai: /);
+    assert.match(reason, /failed its checks or review 3 times|^Kai: /);
     for (const e of types(t).filter((x) => x.type === 'review.failed')) assert.ok(String(e.data!.feedback).trim(), 'failed reviews carry feedback');
   });
 

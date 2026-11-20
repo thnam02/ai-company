@@ -1,4 +1,4 @@
-import type { Goal, PlanTask, Task } from '@ai-company/core';
+import type { Goal, PlanTask, RubricItem, Task } from '@ai-company/core';
 import type { CheckpointStore } from './checkpoints.ts';
 import { PLAN_SCHEMA, VERDICT_SCHEMA, feedbackMessage, newFenceTag, plannerPrompt, reviewerPrompt, roleMemory, workerSystem, workerTask } from './context.ts';
 import { totalTokens, type ChatMessage, type ChatResult, type ModelOptions, type ModelProvider, type ToolCall, type ToolDefinition } from './model.ts';
@@ -274,25 +274,75 @@ export async function runReviewer(ctx: RoleContext, task: Task): Promise<Progres
     const recorded = await ctx.port.recordGoalStep(task.goalId, ctx.agent.id, totalTokens(result.usage));
     if (!recorded.ok) return false;
     const v = parseJson(result.text);
-    if (v && typeof v.passed === 'boolean' && typeof v.feedback === 'string') {
-      const score = typeof v.score === 'number' && Number.isFinite(v.score) ? Math.min(1, Math.max(0, v.score)) : v.passed ? 1 : 0;
-      const reviewed = await ctx.port.recordReview(task.id, ctx.agent.id, { passed: v.passed, score, feedback: v.feedback });
+    const rubric = v ? toRubric(task.acceptanceCriteria, v.criteria) : 'Answer only with JSON matching the schema.';
+    if (typeof rubric !== 'string') {
+      const verdict = fromRubric(rubric, typeof v.feedback === 'string' ? v.feedback : '');
+      const reviewed = await ctx.port.recordReview(task.id, ctx.agent.id, verdict);
       if (reviewed.ok) {
-        ctx.log(`${ctx.agent.name} ${v.passed ? 'passed' : 'sent back'} "${task.title}"`);
+        ctx.log(`${ctx.agent.name} ${verdict.passed ? 'passed' : 'sent back'} "${task.title}" (${rubric.filter((r) => r.met).length} of ${rubric.length} criteria met)`);
         return true;
       }
-      // The task moved on (paused company, budget, CEO): stop instead of retrying.
       const now = (await ctx.port.view()).tasks.find((t) => t.id === task.id);
+      // Its files changed and were checked again: that is progress; the next review starts from what is there now.
+      if (now && JSON.stringify(now.checkedFiles) !== JSON.stringify(task.checkedFiles)) return true;
+      // The task moved on (paused company, budget, CEO): stop instead of retrying.
       if (now?.state !== 'review') return false;
       messages.push(answer(result), { role: 'user', content: `That verdict was refused: ${reviewed.error}. Answer again.` });
     } else {
-      messages.push(answer(result), { role: 'user', content: 'Answer only with JSON: {"passed": boolean, "score": number, "feedback": string}.' });
+      messages.push(answer(result), { role: 'user', content: `${rubric} Answer with JSON: {"criteria": [{"criterion", "met", "evidence"}, …], "feedback": string}.` });
     }
   }
   // Not progress: the runtime moves on to other work and backs off, and the
   // goal budget (which also covers tasks in review) bounds the retries.
   ctx.log(`${ctx.agent.name} gave no usable verdict for "${task.title}"; will try again later`);
   return false;
+}
+
+/**
+ * Matches the model's items to the acceptance criteria, each item to at
+ * most one criterion: by its text or its number ("2", "2. …"). Only when no
+ * item names any criterion are they taken in order. A rubric that does not
+ * fit gives what to fix, so the reviewer is asked again: a guess here could
+ * turn a "not met" into a pass.
+ */
+export function toRubric(criteria: string[], raw: unknown): RubricItem[] | string {
+  if (!Array.isArray(raw)) return 'Your answer had no "criteria" list.';
+  const items = raw.filter((x): x is { criterion?: unknown; met: boolean; evidence?: unknown } => !!x && typeof x === 'object' && typeof x.met === 'boolean');
+  // Dropping a malformed item could drop the one that said "not met".
+  if (items.length !== raw.length) return 'Every item needs "criterion" (text), "met" (true or false) and "evidence" (text).';
+  if (items.length !== criteria.length) return `Give exactly ${criteria.length} criteria items, one per acceptance criterion, in order (you gave ${items.length}).`;
+  const norm = (s: unknown) => String(s ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+  const target = (item: { criterion?: unknown }): number => {
+    const text = norm(item.criterion);
+    const byText = criteria.findIndex((c) => norm(c) === text || norm(c) === text.replace(/^\d+[.)]\s*/, ''));
+    if (byText >= 0) return byText;
+    const n = /^(\d+)[.)]?$/.exec(text);
+    return n && Number(n[1]) >= 1 && Number(n[1]) <= criteria.length ? Number(n[1]) - 1 : -1;
+  };
+  const targets = items.map(target);
+  const order = targets.every((t) => t === -1) ? items.map((_, i) => i) : targets;
+  const missing = criteria.filter((_, i) => order.filter((t) => t === i).length !== 1);
+  if (missing.length) {
+    return `Give one item for each acceptance criterion, with its text copied exactly. Not judged exactly once: ${missing.map((c) => `"${c}"`).join(', ')}.`;
+  }
+  return criteria.map((criterion, i) => {
+    const item = items[order.indexOf(i)];
+    const evidence = typeof item.evidence === 'string' ? item.evidence.trim().slice(0, 1_500) : '';
+    // The engine needs a note on an unmet criterion; say so when the model gave none.
+    const note = evidence || (item.met ? '' : 'not met (the reviewer gave no detail)');
+    return { criterion, met: item.met, ...(note ? { note } : {}) };
+  });
+}
+
+/** Code decides: the work passes only if every criterion is met; the score is the share met. */
+export function fromRubric(rubric: RubricItem[], feedback: string) {
+  const unmet = rubric.filter((r) => !r.met);
+  const passed = unmet.length === 0;
+  const score = rubric.length ? Math.round((100 * (rubric.length - unmet.length)) / rubric.length) / 100 : 1;
+  const text = passed
+    ? feedback.trim()
+    : ['Not met:', ...unmet.map((r) => `- ${r.criterion}: ${r.note}`), ...(feedback.trim() ? ['', feedback.trim()] : [])].join('\n');
+  return { passed, score, feedback: text, rubric };
 }
 
 // ───────────────────────── shared ─────────────────────────

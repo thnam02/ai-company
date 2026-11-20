@@ -44,6 +44,19 @@ describe('stuck timer', () => {
     assert.equal(runs.length, 2);
   });
 
+  test('each tick also retries work that waits on it (automated checks)', async (t) => {
+    t.mock.timers.enable({ apis: ['setInterval'] });
+    const engine = new WorkflowEngine({ policy: makePolicy(), store: new MemoryDurableEventStore() });
+    let retries = 0;
+    const stop = startStuckTimer({ run: async (fn) => fn(), engine, alsoEachTick: async () => void retries++ });
+    t.mock.timers.tick(30_000);
+    await new Promise((r) => setImmediate(r));
+    t.mock.timers.tick(30_000);
+    await new Promise((r) => setImmediate(r));
+    stop();
+    assert.equal(retries, 2);
+  });
+
   test('a tick never overlaps a slow previous tick', async (t) => {
     t.mock.timers.enable({ apis: ['setInterval'] });
     const engine = new WorkflowEngine({ policy: makePolicy(), store: new MemoryDurableEventStore() });

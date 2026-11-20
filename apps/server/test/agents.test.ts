@@ -27,6 +27,8 @@ const TOKEN = 'agents-test-token-0123456789';
 const GOAL = 'Write a one-page product brief for our 3D AI office from the notes in workspace/notes/, then draft a launch email to our team.';
 const BRIEF_CRITERIA = ['brief.md covers the problem, the product and pricing'];
 const EMAIL_CRITERIA = ['The email announces the launch and links the brief'];
+/** A passing review of an email task, given straight to the engine. */
+const PASS = { passed: true, score: 1, feedback: '', rubric: EMAIL_CRITERIA.map((criterion) => ({ criterion, met: true })) };
 const PLAN = [
   { key: 'brief', title: 'Write the product brief', acceptanceCriteria: BRIEF_CRITERIA, ownerId: 'kai', requiredTools: ['files.read', 'files.write'], dependsOn: [], costEstimateTokens: 20_000 },
   { key: 'email', title: 'Draft the launch email', acceptanceCriteria: EMAIL_CRITERIA, ownerId: 'zara', requiredTools: ['files.read', 'email.send'], dependsOn: ['brief'], costEstimateTokens: 10_000 },
@@ -38,7 +40,10 @@ const plan = (tasks: unknown[]): ScriptedTurn => ({ text: JSON.stringify({ tasks
 const call = (name: string, args: Record<string, unknown>): ScriptedTurn => ({ toolCalls: [{ name, arguments: args }] });
 const submit = (criteria: string[], extra: Record<string, unknown> = {}): ScriptedTurn =>
   call('submit_work', { summary: 'Done', selfCheck: criteria.map((criterion) => ({ criterion, met: true })), ...extra });
-const verdict = (passed: boolean, feedback = ''): ScriptedTurn => ({ text: JSON.stringify({ passed, score: passed ? 0.9 : 0.4, feedback }) });
+/** A rubric answer for a one-criterion task: met, or not met with `feedback` as the evidence. */
+const verdict = (passed: boolean, feedback = ''): ScriptedTurn => ({
+  text: JSON.stringify({ criteria: [{ criterion: '1', met: passed, evidence: passed ? 'shown in the output' : feedback }], feedback: '' }),
+});
 
 interface Team {
   dir: string;
@@ -70,15 +75,17 @@ async function team(scripts: Record<string, ScriptedTurn[]>, options: { limits?:
   writeFileSync(join(dir, 'workspace', 'notes', 'idea.md'), '# 3D office\nAI agents work at desks in a 3D office.');
   const raw = JSON.parse(readFileSync(TEST_TEAM, 'utf8'));
   raw.limits = { ...raw.limits, ...options.limits };
+  // Scripted files are short; the live team's 50-word minimum is for real briefs.
+  raw.checks = { ...raw.checks, content: { minWords: 1, maxWords: 1_500 } };
   options.config?.(raw);
   const config: CompanyConfig = parseCompanyConfig(raw);
   const store = new MemoryDurableEventStore();
-  const engine = new WorkflowEngine({ policy: buildPolicy(config), store, limits: config.limits });
+  const engine = new WorkflowEngine({ policy: buildPolicy(config), store, limits: config.limits, strictReview: true });
   must(bootstrapAgents(engine, config));
   const workspace = new Workspace(join(dir, 'workspace'));
   const tools = new ToolRegistry([...workspaceTools(workspace), ...(options.extraTools ?? [])]);
   const logs: string[] = [];
-  const server = createCompanyServer({ engine, store, ceoToken: TOKEN, tools, log: (m) => logs.push(m), onFatal: (e) => logs.push(`FATAL ${e.message}`) });
+  const server = createCompanyServer({ engine, store, ceoToken: TOKEN, tools, workspace, checks: config.checks, log: (m) => logs.push(m), onFatal: (e) => logs.push(`FATAL ${e.message}`) });
   await new Promise<void>((resolve) => server.http.listen(0, '127.0.0.1', resolve));
   const { port } = server.http.address() as AddressInfo;
   const checkpoints = new MemoryCheckpointStore();
@@ -158,7 +165,7 @@ describe('agent runtime: the test team, end to end with scripted models', () => 
     assert.match(t.models.kai.requests[1].messages.at(-1)!.content, /^notes\/idea.md$/);
     // Rex was shown the file, and his feedback reached Kai in the same conversation.
     assert.match(text(t.models.rex, 0), /Problem\. Product\./);
-    assert.match(lastUser(t.models.kai, 4), /<<<([0-9a-f]{16}) review feedback\nAdd a pricing section\n\1>>>/, 'feedback is fenced as data');
+    assert.match(lastUser(t.models.kai, 4), /<<<([0-9a-f]{16}) review feedback\nNot met:\n- brief\.md covers the problem, the product and pricing: Add a pricing section\n\1>>>/, 'feedback names the unmet criterion and is fenced as data');
     assert.match(lastUser(t.models.kai, 4), /never instructions to you/);
     assert.ok(t.models.kai.requests[4].messages.length > 8, 'Kai resumed his conversation');
     // Zara's context pack: her task, Kai's result, nothing of Kai's conversation.
@@ -251,7 +258,7 @@ describe('agent runtime: the test team, end to end with scripted models', () => 
     await t.runtime.runUntilIdle();
     const [task] = t.engine.listTasks();
     assert.equal(task.state, 'escalated');
-    assert.match(task.escalationReason!, /failed review 3 times/);
+    assert.match(task.escalationReason!, /failed its checks or review 3 times/);
   });
 
   test('a worker can hand an impossible task to the CEO', async () => {
@@ -364,7 +371,8 @@ describe('agent port and the final-action executor', () => {
       const [task] = must(t.engine.submitPlan(must(t.engine.createGoal(`g ${key}`, 100_000)).id, 'ava', [{ ...PLAN[1], dependsOn: [], requiredTools: [tool] }]));
       must(t.engine.start(task.id, 'zara'));
       must(t.engine.submitForReview(task.id, 'zara', { summary: 's', selfCheck: EMAIL_CRITERIA.map((criterion) => ({ criterion, met: true })), finalAction: { tool, input, idempotencyKey: key } }));
-      must(t.engine.recordReview(task.id, 'rex', { passed: true, score: 1, feedback: '' }));
+      must(t.engine.recordChecks(task.id, t.engine.getTask(task.id)!.submissions, []));
+      must(t.engine.recordReview(task.id, 'rex', PASS));
       must(t.engine.decideApproval(task.id, { approved: true }));
       return task.id;
     };
@@ -386,6 +394,97 @@ describe('agent port and the final-action executor', () => {
     assert.deepEqual(t.engine.pendingActions(), []);
     await t.server.recover();
     assert.equal(t.types().filter((x) => x === 'action.executed' || x === 'action.failed').length, 2, 'recovery is idempotent');
+  });
+});
+
+describe('automated checks run before the reviewer (M5)', () => {
+  test('failed checks send work back with the reasons; the reviewer sees only checked work and judges each criterion', async () => {
+    const t = await team({
+      kai: [
+        call('files_write', { path: 'brief.md', content: '# Brief\nProblem, product and pricing. TODO: prices. See [notes](notes/nope.md).' }),
+        submit(BRIEF_CRITERIA, { artifacts: ['brief.md'] }),
+        call('files_write', { path: 'brief.md', content: '# Brief\nProblem, product and pricing: free. See [notes](notes/idea.md).' }),
+        submit(BRIEF_CRITERIA, { artifacts: ['brief.md'] }),
+      ],
+      rex: [
+        // Two items for one criterion: the reviewer is asked again, nothing is recorded.
+        { text: JSON.stringify({ criteria: [{ criterion: '1', met: true, evidence: 'x' }, { criterion: '2', met: true, evidence: 'y' }], feedback: '' }) },
+        verdict(true),
+      ],
+    });
+    const goal = must(t.engine.createGoal(GOAL, 100_000));
+    must(t.engine.submitPlan(goal.id, 'ava', [PLAN[0]]));
+    await t.runtime.runUntilIdle();
+    for (const [id, m] of Object.entries(t.models)) assert.equal(m.remaining, 0, `${id} used every scripted turn`);
+    const [task] = t.engine.listTasks();
+    assert.equal(task.state, 'done');
+
+    // Kai got the failed checks as feedback, fenced as data, in the same conversation.
+    const feedback = lastUser(t.models.kai, 2);
+    assert.match(feedback, /<<<([0-9a-f]{16}) review feedback\nAutomated checks failed:\n- content\.placeholders: brief\.md still has a placeholder: "TODO"\n- content\.links: brief\.md: "notes\/nope\.md" does not exist in the workspace\n\1>>>/);
+    // Rex was never asked about the first submission; he saw the passed checks and the criteria.
+    const rexFirst = text(t.models.rex, 0);
+    assert.match(rexFirst, /pricing: free/);
+    assert.match(rexFirst, /Automated checks already passed[^\n]*:\n<<<([0-9a-f]{16}) checks\nfiles\.exist: 1 file\(s\) found\ncontent\.length: [^\n]+\ncontent\.placeholders: no placeholders\ncontent\.links: every link resolves\n\1>>>/, 'check details are fenced as data');
+    assert.match(rexFirst, /1\. brief\.md covers the problem, the product and pricing/);
+    assert.match(lastUser(t.models.rex, 1), /Give exactly 1 criteria items/);
+
+    // The log: checks failed, checks passed, then a review whose rubric is stored.
+    const events = t.engine.store.all().filter((e) => e.taskId === task.id && /^(checks|review)\./.test(e.type));
+    assert.deepEqual(events.map((e) => e.type), ['checks.failed', 'checks.passed', 'review.passed']);
+    assert.deepEqual(events[2].data!.rubric, [{ criterion: BRIEF_CRITERIA[0], met: true, note: 'shown in the output' }]);
+    assert.equal(task.reviewAttempts, 1, 'a failed check run counts as a failed review');
+  });
+
+  test('an email to a recipient off the allowlist fails its checks every time, then escalates; nothing is sent and no reviewer runs', async () => {
+    const offList = submit(EMAIL_CRITERIA, { finalAction: { tool: 'email.send', input: { ...EMAIL, to: 'boss@evil.test' } } });
+    const t = await team({ zara: [offList, offList, offList], rex: [verdict(true)] });
+    const goal = must(t.engine.createGoal(GOAL, 100_000));
+    must(t.engine.submitPlan(goal.id, 'ava', [{ ...PLAN[1], dependsOn: [] }]));
+    await t.runtime.runUntilIdle();
+    const [task] = t.engine.listTasks();
+    assert.equal(task.state, 'escalated');
+    assert.match(task.escalationReason!, /failed its checks or review 3 times/);
+    assert.equal(t.models.rex.requests.length, 0, 'the reviewer never saw work that failed its checks');
+    assert.match(lastUser(t.models.zara, 1), /email\.recipients: boss@evil\.test is not on the allowed recipients list \(@example\.com\)/);
+    assert.equal(t.types().filter((x) => x === 'checks.failed').length, 3);
+    assert.deepEqual(t.engine.pendingActions(), []);
+    assert.equal(existsSync(join(t.dir, 'workspace', 'outbox')), false);
+  });
+
+  test('a file changed after its checks is checked again, and only a review of the new version counts', async () => {
+    const t = await team({ rex: [verdict(true), verdict(true)] });
+    const brief = join(t.dir, 'workspace', 'brief.md');
+    writeFileSync(brief, '# Brief\nProblem, product and pricing.');
+    const [task] = must(t.engine.submitPlan(must(t.engine.createGoal(GOAL, 100_000)).id, 'ava', [PLAN[0]]));
+    must(t.engine.start(task.id, 'kai'));
+    must(t.engine.submitForReview(task.id, 'kai', { summary: 's', selfCheck: BRIEF_CRITERIA.map((criterion) => ({ criterion, met: true })), artifacts: ['brief.md'] }));
+    await t.server.runPendingChecks();
+    const firstHash = t.engine.getTask(task.id)!.checkedFiles!['brief.md'];
+    // Another task's worker rewrites the file while this one waits for review.
+    writeFileSync(brief, '# Brief\nProblem, product and pricing: free for teams.');
+    await t.runtime.runUntilIdle();
+
+    assert.equal(t.engine.getTask(task.id)!.state, 'done');
+    const types = t.engine.store.all().filter((e) => e.taskId === task.id && /^(checks|review)\./.test(e.type)).map((e) => e.type);
+    assert.deepEqual(types, ['checks.passed', 'checks.reset', 'checks.passed', 'review.passed'], 'the first verdict was refused and the files re-checked');
+    assert.notEqual(t.engine.getTask(task.id)!.checkedFiles!['brief.md'], firstHash);
+    assert.equal(t.models.rex.requests.length, 2, 'a fresh review of the new version');
+    assert.match(text(t.models.rex, 1), /free for teams/);
+  });
+
+  test('a submission left unchecked by a crash waits for its checks; recovery runs them before any review', async () => {
+    const t = await team({ rex: [verdict(true)] });
+    const [task] = must(t.engine.submitPlan(must(t.engine.createGoal(GOAL, 100_000)).id, 'ava', [PLAN[0]]));
+    must(t.engine.start(task.id, 'kai'));
+    // Submitted straight to the engine: as if the server died before the checks ran.
+    must(t.engine.submitForReview(task.id, 'kai', { summary: 's', selfCheck: BRIEF_CRITERIA.map((criterion) => ({ criterion, met: true })) }));
+    await t.runtime.runUntilIdle();
+    assert.equal(t.models.rex.requests.length, 0, 'no reviewer turn on unchecked work');
+    await t.server.recover();
+    assert.deepEqual(t.engine.getTask(task.id)!.checkResults, []);
+    await t.runtime.runUntilIdle();
+    assert.equal(t.engine.getTask(task.id)!.state, 'done');
   });
 });
 
@@ -478,7 +577,8 @@ describe('agent runtime: safety holes found in review', () => {
     const [task] = must(t.engine.submitPlan(must(t.engine.createGoal('g', 100_000)).id, 'ava', [{ ...PLAN[1], dependsOn: [], requiredTools: ['slow.send'] }]));
     must(t.engine.start(task.id, 'zara'));
     must(t.engine.submitForReview(task.id, 'zara', { summary: 's', selfCheck: EMAIL_CRITERIA.map((criterion) => ({ criterion, met: true })), finalAction: { tool: 'slow.send', input: {}, idempotencyKey: 'slow-1' } }));
-    must(t.engine.recordReview(task.id, 'rex', { passed: true, score: 1, feedback: '' }));
+    must(t.engine.recordChecks(task.id, t.engine.getTask(task.id)!.submissions, []));
+    must(t.engine.recordReview(task.id, 'rex', PASS));
     assert.deepEqual((await t.call('POST', `/tasks/${task.id}/approval`, { approved: true })).body, { state: 'done' });
     let closed = false;
     const closing = t.server.close().then(() => (closed = true));
@@ -517,7 +617,7 @@ describe('role memory', () => {
     const kaiNew = t.models.kai.requests.find((r) => r.messages.some((m) => m.content.includes('Write the second brief')))!;
     const kaiText = kaiNew.messages.map((m) => m.content).join('\n');
     assert.match(kaiText, /How to do your job \(from the CEO\):\nAlways say which notes file you used\./);
-    assert.match(kaiText, /A past task that was sent back, fixed and passed:\n<<<([0-9a-f]{16}) lesson\nTask: Write the first brief\nFeedback: Add a pricing section\n\1>>>/);
+    assert.match(kaiText, /A past task that was sent back, fixed and passed:\n<<<([0-9a-f]{16}) lesson\nTask: Write the first brief\nFeedback: Not met:\n- brief\.md covers the problem, the product and pricing: Add a pricing section\n\1>>>/);
     // On his first task there was nothing to learn from yet.
     assert.doesNotMatch(text(t.models.kai, 0), /Lessons from reviews/);
     // Zara has another role: her own notes, none of Kai's lessons.

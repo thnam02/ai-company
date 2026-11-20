@@ -107,7 +107,8 @@ export class AgentRuntime {
     const agent = (id: string) => view.agents.find((a) => a.id === id);
     const done = (id: string) => view.tasks.find((t) => t.id === id)?.state === 'done';
 
-    for (const task of view.tasks.filter((t) => t.state === 'review')) {
+    // Reviewers start only once the gateway's automated checks have passed.
+    for (const task of view.tasks.filter((t) => t.state === 'review' && t.checkResults !== null)) {
       const reviewer = view.agents.find((a) => a.kind === 'reviewer' && available(a) && a.id !== task.ownerId);
       if (reviewer) yield { kind: 'review', agent: reviewer, task };
     }

@@ -161,14 +161,26 @@ export function feedbackMessage(feedback: string | null, tag: string = newFenceT
 
 // ───────────────────────── reviewer ─────────────────────────
 
+/** The reviewer's rubric: one judgement per acceptance criterion. Code, not the model, turns it into pass or fail. */
 export const VERDICT_SCHEMA: JsonSchema = {
   type: 'object',
   properties: {
-    passed: { type: 'boolean' },
-    score: { type: 'number' },
+    criteria: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          criterion: { type: 'string' },
+          met: { type: 'boolean' },
+          evidence: { type: 'string' },
+        },
+        required: ['criterion', 'met', 'evidence'],
+        additionalProperties: false,
+      },
+    },
     feedback: { type: 'string' },
   },
-  required: ['passed', 'score', 'feedback'],
+  required: ['criteria', 'feedback'],
   additionalProperties: false,
 };
 
@@ -181,20 +193,22 @@ export function reviewerPrompt(
 ): { system: string; user: string } {
   const parts = [
     `Task: ${task.title}`,
-    'Acceptance criteria:',
-    list(task.acceptanceCriteria),
-    '',
-    "The worker's summary:",
-    fence(tag, 'summary', task.summary ?? '(none)'),
+    'Acceptance criteria (judge each one):',
+    task.acceptanceCriteria.map((c, i) => `${i + 1}. ${c}`).join('\n'),
   ];
+  if (task.checkResults?.length) {
+    parts.push('', 'Automated checks already passed (files exist, length, placeholders, links, email rules):', fence(tag, 'checks', task.checkResults.map((c) => `${c.name}: ${c.detail}`).join('\n')));
+  }
+  parts.push('', "The worker's summary:", fence(tag, 'summary', task.summary ?? '(none)'));
   for (const f of files) parts.push('', `File ${f.path}:`, fence(tag, `file ${f.path}`, f.content));
   if (task.finalAction) {
-    parts.push('', `Proposed final action (runs only if you pass the work): ${task.finalAction.tool} with input:`, JSON.stringify(task.finalAction.input, null, 2));
+    parts.push('', `Proposed final action (runs only if you pass the work): ${task.finalAction.tool} with input:`, fence(tag, 'final action input', JSON.stringify(task.finalAction.input, null, 2)));
   }
   return {
     system: [
       `You are ${agent.name}, an independent reviewer at an AI company. You check another agent's work against the task's acceptance criteria.`,
-      'Pass only if every criterion is clearly met. If you fail it, say exactly what to fix. score is from 0 to 1.',
+      'Judge every acceptance criterion on its own, in order: one item each, with the criterion text copied, met true only if the output clearly meets it, and evidence pointing to the part of the output that shows it (or, if it is not met, exactly what is missing and how to fix it).',
+      'You do not decide pass or fail: the work passes only if every criterion is met. Use feedback for anything else the worker should fix.',
       untrustedRule(tag),
       ...notesFor(notes),
       'Answer only with JSON matching the schema.',

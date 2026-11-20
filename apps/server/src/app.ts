@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { fail, ok, type Outcome, type PlanTask, type Resolution, type Result, type ReviewVerdict, type Submission, type TaskState, type WorkflowEngine } from '@ai-company/core';
 import type { AgentPort, AgentView, CompanyView, ToolAccess } from '@ai-company/agents';
-import { ToolGateway, ToolRegistry, type CredentialStore, type GatewayOptions, type ToolSettings } from '@ai-company/gateway';
+import { ToolGateway, ToolRegistry, checkSubmission, fingerprint, type CheckSettings, type CredentialStore, type GatewayOptions, type ToolSettings, type Workspace } from '@ai-company/gateway';
 import type { DurableEventStore } from './durable-store.ts';
 import { attachEventStream, type EventStream } from './stream.ts';
 
@@ -20,6 +20,10 @@ export interface ServerOptions {
   tools?: ToolRegistry;
   /** Tool credentials, held by the gateway only (invariant 6). */
   credentials?: CredentialStore;
+  /** The workspace whose files the automated checks read (gate 3). Without it only emails are checked. */
+  workspace?: Workspace;
+  /** Check rules from the company config. */
+  checks?: CheckSettings;
   /** Per-tool timeout, attempts and rate limit from the company config. */
   toolSettings?: Record<string, Partial<ToolSettings>>;
   /** Test hooks for the gateway (clock, sleep, keys). */
@@ -52,6 +56,8 @@ export interface CompanyServer {
    * once on boot, before agents start.
    */
   recover(): Promise<void>;
+  /** Gate 3 for any submission still waiting for its checks (the stuck timer retries them). */
+  runPendingChecks(): Promise<void>;
   /** True once the store has failed; the server then refuses all work. */
   readonly failed: boolean;
   close(): Promise<void>;
@@ -132,7 +138,10 @@ export function createCompanyServer(options: ServerOptions): CompanyServer {
       pendingToolCalls: () => run(() => engine.pendingToolCalls()),
       pendingActions: () => run(() => engine.pendingActions()),
       isPaused: () => run(() => engine.isCompanyPaused()),
+      awaitingChecks: () => run(() => engine.awaitingChecks()),
+      recordChecks: (taskId, submission, results, files) => run(() => engine.recordChecks(taskId, submission, results, files)),
     },
+    checks: (submitted) => checkSubmission(submitted, options.workspace ?? null, options.checks),
     tools: options.tools ?? new ToolRegistry(),
     ...(options.credentials ? { credentials: options.credentials } : {}),
     ...(options.toolSettings ? { settings: options.toolSettings } : {}),
@@ -154,9 +163,34 @@ export function createCompanyServer(options: ServerOptions): CompanyServer {
     recordStep: (taskId: string, agentId: string, tokens: number) => run(() => engine.recordStep(taskId, agentId, tokens)),
     recordGoalStep: (goalId: string, agentId: string, tokens: number) => run(() => engine.recordGoalStep(goalId, agentId, tokens)),
     callTool: (taskId: string, agentId: string, tool: string, input: unknown) => gateway.call(taskId, agentId, tool, input),
-    submitForReview: (taskId: string, agentId: string, submission: Submission) => run(() => engine.submitForReview(taskId, agentId, submission)),
+    submitForReview: async (taskId: string, agentId: string, submission: Submission): Promise<Result<TaskState>> => {
+      const r = await run(() => engine.submitForReview(taskId, agentId, submission));
+      // Gate 3 runs before any reviewer sees the work; the worker learns the outcome from its task.
+      if (r.ok) await gateway.runPendingChecks();
+      return r;
+    },
     recordReview: async (taskId: string, reviewerId: string, verdict: ReviewVerdict): Promise<Result<TaskState>> => {
-      const r = await run(() => engine.recordReview(taskId, reviewerId, verdict));
+      // A verdict is about the checked files. They are compared and the review
+      // recorded in one synchronous step, so nothing can write in between.
+      let changed = false;
+      const r = await run((): Result<Outcome> => {
+        const checked = engine.checkedFiles(taskId);
+        if (checked) {
+          const now = fingerprint(checked.artifacts, options.workspace ?? null);
+          const differ = [...new Set([...Object.keys(checked.files), ...Object.keys(now)])].filter((p) => checked.files[p] !== now[p]);
+          if (differ.length) {
+            const reset = engine.resetChecks(taskId, `changed after their checks: ${differ.join(', ')}`);
+            if (!reset.ok) return reset;
+            changed = true;
+            return fail(`${differ.join(', ')} changed after the automated checks, so the work is checked again; review the new version`);
+          }
+        }
+        return engine.recordReview(taskId, reviewerId, verdict);
+      });
+      if (changed) {
+        log(`files of task ${taskId} changed after their checks; checking again`);
+        await gateway.runPendingChecks();
+      }
       if (!r.ok) return r;
       release(r.value, taskId);
       return ok(r.value.state);
@@ -283,6 +317,7 @@ export function createCompanyServer(options: ServerOptions): CompanyServer {
     run,
     agentPort,
     recover: () => gateway.recover(),
+    runPendingChecks: () => gateway.runPendingChecks(),
     get failed() {
       return failure !== null;
     },

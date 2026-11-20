@@ -13,7 +13,10 @@ export interface RunReport {
     tasksDone: number;
     escalations: number;
     reviewedTasks: number;
+    /** Tasks whose first check run and first review both passed. */
     firstTryReviewPasses: number;
+    /** Automated check runs that sent work back before any reviewer saw it (gate 3). */
+    failedCheckRuns: number;
     /** `failed`: allowed calls whose tool then failed (timeout, error, interrupted). */
     toolCalls: { allowed: number; denied: number; duplicate: number; failed: number };
     /** Every recorded model token: planning, work and review. */
@@ -28,7 +31,8 @@ export interface RunReport {
     state: string;
     steps: number;
     tokens: number;
-    reviews: ('passed' | 'failed')[];
+    /** In order; "checks failed" is a check run that sent the work back before review. */
+    reviews: ('passed' | 'failed' | 'checks failed')[];
     /** Agent time: started until done, escalated, cancelled or handed to the CEO for approval. */
     seconds: number | null;
     escalationReason: string | null;
@@ -122,6 +126,10 @@ export function buildRunReport(events: readonly EngineEvent[]): RunReport {
       case 'task.submitted':
         t!.state = 'review';
         break;
+      case 'checks.failed':
+        t!.reviews.push('checks failed');
+        t!.state = 'working';
+        break;
       case 'review.passed':
       case 'review.failed':
         t!.reviews.push(e.type === 'review.passed' ? 'passed' : 'failed');
@@ -172,6 +180,7 @@ export function buildRunReport(events: readonly EngineEvent[]): RunReport {
       escalations,
       reviewedTasks: reviewed.length,
       firstTryReviewPasses: reviewed.filter((t) => t.reviews[0] === 'passed').length,
+      failedCheckRuns: taskRows.reduce((n, t) => n + t.reviews.filter((r) => r === 'checks failed').length, 0),
       toolCalls: tools,
       tokens,
     },
@@ -195,6 +204,7 @@ export function formatRunReport(report: RunReport, extras: RunExtras = {}): stri
     `| Plans accepted first try | ${s.plansAcceptedFirstTry} of ${s.goals} |`,
     `| Re-plans | ${s.replans} |`,
     `| First-try review pass rate | ${pct(s.firstTryReviewPasses, s.reviewedTasks)} |`,
+    `| Check runs failed (before review) | ${s.failedCheckRuns} |`,
     `| Tasks done | ${s.tasksDone} of ${s.tasks} |`,
     `| Escalations | ${s.escalations} |`,
     `| Tool calls (allowed / denied / duplicate / failed) | ${s.toolCalls.allowed} / ${s.toolCalls.denied} / ${s.toolCalls.duplicate} / ${s.toolCalls.failed} |`,

@@ -143,7 +143,8 @@ export async function boot(config: BootConfig, hooks: BootHooks = {}): Promise<R
   let checkpoints: SqliteCheckpointStore | undefined;
   let runtime: AgentRuntime | undefined;
   try {
-    const engine = new WorkflowEngine({ policy: buildPolicy(company), store, limits: company.limits });
+    // strictReview: no review before the automated checks pass, and every review judges each criterion (M5).
+    const engine = new WorkflowEngine({ policy: buildPolicy(company), store, limits: company.limits, strictReview: true });
     log(`replayed ${store.size} events`);
 
     // The gateway runs every tool; it is needed even with agents off (a CEO approval releases a final action).
@@ -160,6 +161,8 @@ export async function boot(config: BootConfig, hooks: BootHooks = {}): Promise<R
       tools,
       credentials,
       toolSettings: company.toolSettings,
+      workspace,
+      checks: company.checks,
       log,
       onFatal: hooks.onFatal ?? (() => process.exit(1)),
     });
@@ -178,7 +181,8 @@ export async function boot(config: BootConfig, hooks: BootHooks = {}): Promise<R
 
     await server.recover();
 
-    stopTimer = startStuckTimer({ run, engine, log });
+    const checking = server;
+    stopTimer = startStuckTimer({ run, engine, log, alsoEachTick: () => checking.runPendingChecks() });
     await new Promise<void>((resolve, reject) => {
       http.once('error', reject);
       http.listen(config.port, config.host, () => resolve());

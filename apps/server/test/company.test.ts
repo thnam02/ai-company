@@ -11,6 +11,28 @@ import { TEST_CONFIG, must } from './helpers.ts';
 
 const base = () => structuredClone(TEST_CONFIG) as any;
 
+describe('company config: automated checks', () => {
+  test('defaults apply when absent; fields are checked', () => {
+    assert.deepEqual(parseCompanyConfig(base()).checks.email.allowedRecipients, []);
+    const ok = parseCompanyConfig({ ...base(), checks: { content: { minWords: 10 }, email: { allowedRecipients: ['@example.com', 'ceo@acme.test'] } } }).checks;
+    assert.deepEqual([ok.content.minWords, ok.content.maxWords, ok.email.allowedRecipients], [10, 5_000, ['@example.com', 'ceo@acme.test']]);
+    for (const [checks, error] of [
+      [[], /"checks" must be an object/],
+      [{ code: {} }, /unknown checks section "code"/],
+      [{ content: { minWords: 1.5 } }, /checks\.content\.minWords must be a whole number/],
+      [{ content: { minWords: 100, maxWords: 10 } }, /minWords is above maxWords/],
+      [{ content: { words: 3 } }, /unknown checks\.content field "words"/],
+      [{ email: { allowedRecipients: ['example.com'] } }, /allowedRecipients/],
+      [{ email: { allowedRecipients: 'x@y.z' } }, /allowedRecipients/],
+      [{ email: { maxBodyWords: 0 } }, /maxBodyWords/],
+      [{ email: { cc: [] } }, /unknown checks\.email field "cc"/],
+      [{ content: null }, /checks\.content must be an object/],
+    ] as const) {
+      assert.throws(() => parseCompanyConfig({ ...base(), checks }), error, JSON.stringify(checks));
+    }
+  });
+});
+
 describe('company config', () => {
   test('the shipped config is valid and every tool has a tier', () => {
     const config = loadCompanyConfig(DEFAULT_COMPANY_CONFIG);

@@ -72,6 +72,7 @@ describe('run report', () => {
       escalations: 1,
       reviewedTasks: 2,
       firstTryReviewPasses: 1,
+      failedCheckRuns: 0,
       toolCalls: { allowed: 1, denied: 1, duplicate: 0, failed: 1 },
       tokens: 2_500 + 500 + 2_100 + 6_000 + 4_000,
     });
@@ -88,6 +89,25 @@ describe('run report', () => {
     assert.deepEqual(byId[mail.id].action, { tool: 'email.send', ok: true, detail: 'written to outbox/m1.eml' });
     assert.equal(byId[stuck.id].state, 'escalated');
     assert.equal(byId[stuck.id].escalationReason, 'Kai: cannot be done');
+  });
+
+  test('a failed check run counts against the first try and shows in the task row', () => {
+    const engine = new WorkflowEngine({ policy: makePolicy(), limits: TEST_CONFIG.limits, strictReview: true });
+    registerTestAgents(engine);
+    const goal = must(engine.createGoal('Write it', 100_000));
+    const [task] = must(engine.submitPlan(goal.id, 'ava', [{ key: 'a', title: 'Write it', acceptanceCriteria: ['Clear'], ownerId: 'kai', requiredTools: [], costEstimateTokens: 5_000 }]));
+    must(engine.start(task.id, 'kai'));
+    const submit = () => must(engine.submitForReview(task.id, 'kai', { summary: 's', selfCheck: allMet(['Clear']) }));
+    submit();
+    must(engine.recordChecks(task.id, 1, [{ name: 'content.placeholders', ok: false, detail: 'TODO' }]));
+    submit();
+    must(engine.recordChecks(task.id, 2, []));
+    must(engine.recordReview(task.id, 'rex', { passed: true, score: 1, feedback: '', rubric: [{ criterion: 'Clear', met: true }] }));
+    const report = buildRunReport(engine.store.all());
+    assert.deepEqual(report.tasks[0].reviews, ['checks failed', 'passed']);
+    assert.equal(report.summary.failedCheckRuns, 1);
+    assert.equal(report.summary.firstTryReviewPasses, 0);
+    assert.match(formatRunReport(report), /Check runs failed \(before review\) \| 1 \|/);
   });
 
   test('formats as Markdown with the headline numbers and any memory figures', () => {

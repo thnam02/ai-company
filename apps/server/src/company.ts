@@ -13,7 +13,7 @@ import {
   type WorkflowEngine,
 } from '@ai-company/core';
 import { parseModelRef, type ModelOptions } from '@ai-company/agents';
-import { DEFAULT_TOOL_SETTINGS, worstCaseCallMs, type ToolRegistry, type ToolSettings } from '@ai-company/gateway';
+import { DEFAULT_CHECK_SETTINGS, DEFAULT_TOOL_SETTINGS, worstCaseCallMs, type CheckSettings, type ToolRegistry, type ToolSettings } from '@ai-company/gateway';
 
 /**
  * Company configuration: tools with risk tiers, the tier-2 auto-approve list,
@@ -32,6 +32,47 @@ export interface CompanyConfig {
   roleNotes: Record<string, string>;
   /** Per-tool gateway limits (timeout, attempts, rate); defaults for the rest. */
   toolSettings: Record<string, Partial<ToolSettings>>;
+  /** Rules for the automated checks of submissions (gate 3). */
+  checks: CheckSettings;
+}
+
+const wholeNumber = (v: unknown, min: number, max: number) => Number.isInteger(v) && (v as number) >= min && (v as number) <= max;
+
+function parseChecks(raw: unknown): CheckSettings {
+  const checks = structuredClone(DEFAULT_CHECK_SETTINGS);
+  if (raw === undefined) return checks;
+  const c = raw as any;
+  if (!c || typeof c !== 'object' || Array.isArray(c)) throw new Error('"checks" must be an object');
+  for (const key of Object.keys(c)) if (key !== 'content' && key !== 'email') throw new Error(`unknown checks section "${key}" (content, email)`);
+  for (const section of ['content', 'email'] as const) {
+    const v = c[section];
+    if (v !== undefined && (!v || typeof v !== 'object' || Array.isArray(v))) throw new Error(`checks.${section} must be an object`);
+  }
+  if (c.content !== undefined) {
+    for (const key of Object.keys(c.content)) {
+      if (key !== 'minWords' && key !== 'maxWords') throw new Error(`unknown checks.content field "${key}" (minWords, maxWords)`);
+      if (!wholeNumber(c.content[key], 0, 1_000_000)) throw new Error(`checks.content.${key} must be a whole number`);
+      checks.content[key as 'minWords' | 'maxWords'] = c.content[key];
+    }
+    if (checks.content.minWords > checks.content.maxWords) throw new Error('checks.content.minWords is above maxWords');
+  }
+  if (c.email !== undefined) {
+    for (const key of Object.keys(c.email)) {
+      if (key === 'maxBodyWords') {
+        if (!wholeNumber(c.email.maxBodyWords, 1, 1_000_000)) throw new Error('checks.email.maxBodyWords must be a positive whole number');
+        checks.email.maxBodyWords = c.email.maxBodyWords;
+      } else if (key === 'allowedRecipients') {
+        const list = c.email.allowedRecipients;
+        if (!Array.isArray(list) || !list.every((x: unknown) => typeof x === 'string' && /^[^\s@]*@[^\s@]+\.[^\s@]+$/.test(x))) {
+          throw new Error('checks.email.allowedRecipients must be addresses ("ceo@example.com") or domains ("@example.com")');
+        }
+        checks.email.allowedRecipients = [...list];
+      } else {
+        throw new Error(`unknown checks.email field "${key}" (allowedRecipients, maxBodyWords)`);
+      }
+    }
+  }
+  return checks;
 }
 
 const TOOL_SETTING_CHECKS: Record<keyof ToolSettings, (v: unknown) => boolean> = {
@@ -158,7 +199,7 @@ export function parseCompanyConfig(raw: unknown): CompanyConfig {
     }
   }
 
-  const config: CompanyConfig = { tools, autoApproveTier2: [...autoApproveTier2], limits, agents, modelOptions, roleNotes, toolSettings };
+  const config: CompanyConfig = { tools, autoApproveTier2: [...autoApproveTier2], limits, agents, modelOptions, roleNotes, toolSettings, checks: parseChecks(c.checks) };
   buildPolicy(config); // throws on duplicate tools or a bad auto-approve entry
   return config;
 }
