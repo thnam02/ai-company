@@ -151,6 +151,10 @@ for (const backend of backends) {
       const before = (await first.call('GET', '/state')).body;
       assert.equal(before.tasks.find((t: any) => t.id === build.id).state, 'working');
       assert.equal(before.tasks.find((t: any) => t.id === build.id).steps, 1);
+      // The repo.read allowed before the crash never recorded a result: boot records it as interrupted.
+      const lost = (await first.call('GET', '/events')).body.filter((e: any) => e.type === 'tool.failed');
+      assert.deepEqual(lost.map((e: any) => e.data.idempotencyKey), ['read-1']);
+      assert.match(lost[0].data.detail, /interrupted by a restart/);
       await first.kill();
 
       // A new process rebuilds from the log and sees exactly the same company.

@@ -11,13 +11,10 @@ import {
   AgentRuntime,
   MemoryCheckpointStore,
   ScriptedProvider,
-  ToolRegistry,
-  Workspace,
-  workspaceTools,
   type CheckpointStore,
   type ScriptedTurn,
-  type ToolExecutor,
 } from '@ai-company/agents';
+import { ToolRegistry, Workspace, workspaceTools, type ToolExecutor } from '@ai-company/gateway';
 import { createCompanyServer, type CompanyServer } from '../src/app.ts';
 import { bootstrapAgents, buildPolicy, loadCompanyConfig, parseCompanyConfig, type CompanyConfig } from '../src/company.ts';
 import { MemoryDurableEventStore } from '../src/durable-store.ts';
@@ -90,7 +87,6 @@ async function team(scripts: Record<string, ScriptedTurn[]>, options: { limits?:
     new AgentRuntime({
       port: server.agentPort,
       modelFor: (a) => (models[a.id] ? { provider: models[a.id], model: 'scripted', options: config.modelOptions[a.id] } : undefined),
-      tools,
       workspace,
       checkpoints,
       log: (m) => logs.push(m),
@@ -192,6 +188,18 @@ describe('agent runtime: the test team, end to end with scripted models', () => 
     assert.equal(t.engine.getGoal(goal.id)!.spentTokens, 13 * 120);
     assert.equal(types.filter((x) => x === 'tool.allowed').length, 5);
     assert.equal(types.filter((x) => x === 'action.executed').length, 1);
+
+    // The gateway ran every allowed call, with keys it made, and recorded each result once.
+    const events = t.engine.store.all();
+    const allowedKeys = events.filter((e) => e.type === 'tool.allowed').map((e) => e.data!.idempotencyKey);
+    const resultKeys = events.filter((e) => e.type === 'tool.executed' || e.type === 'tool.failed').map((e) => e.data!.idempotencyKey);
+    assert.deepEqual(resultKeys, allowedKeys);
+    assert.ok(allowedKeys.every((k) => !/^key-/.test(k)), 'tool-call keys come from the gateway, not the agent runtime');
+    for (const e of events.filter((x) => x.type === 'tool.executed')) {
+      const allowed = events.find((x) => x.type === 'tool.allowed' && x.data!.idempotencyKey === e.data!.idempotencyKey)!;
+      assert.ok(allowed.seq < e.seq);
+    }
+    assert.deepEqual(t.engine.pendingToolCalls(), []);
   });
 
   test('the kill switch stops a worker between turns; nothing runs after it', async () => {
@@ -311,12 +319,31 @@ describe('agent port and the final-action executor', () => {
     const t = await team({});
     assert.deepEqual(Object.keys(t.server.agentPort).sort(), [...AGENT_PORT_METHODS].sort());
     assert.ok(Object.isFrozen(t.server.agentPort));
+    // Agents cannot ask for an `allow` and act on it themselves: tools run only in the gateway.
+    assert.equal('requestToolCall' in t.server.agentPort, false);
     const goal = must(t.engine.createGoal(GOAL, 100_000));
     const [task] = must(t.engine.submitPlan(goal.id, 'ava', [PLAN[0]]));
     assert.match((await t.server.agentPort.escalate(task.id, 'zara', 'not mine') as any).error, /only the task owner/);
     const view = await t.server.agentPort.view();
     assert.deepEqual(view.agents.find((a) => a.id === 'zara')!.toolAccess, { 'files.read': 'call', 'files.write': 'call', 'email.send': 'final' });
     assert.deepEqual(view.tools.map((x) => x.name), ['files.read', 'files.write', 'email.send']);
+    // Agents see how to call a tool, never its code or credentials.
+    assert.deepEqual(Object.keys(view.tools[0].runnable!).sort(), ['description', 'parameters']);
+    assert.equal(typeof (view.tools[0].runnable as any).run, 'undefined');
+  });
+
+  test('a worker whose tool fails gets the reason as text; the failure is recorded, not hidden', async () => {
+    const t = await team({
+      kai: [call('files_read', { path: 'nowhere.md' }), call('report_blocked', { reason: 'no notes' })],
+    });
+    const goal = must(t.engine.createGoal(GOAL, 100_000));
+    must(t.engine.submitPlan(goal.id, 'ava', [PLAN[0]]));
+    await t.runtime.runUntilIdle();
+    const failed = t.engine.store.all().find((e) => e.type === 'tool.failed')!;
+    assert.equal(failed.data!.tool, 'files.read');
+    assert.match(failed.data!.detail, /"nowhere.md" does not exist/);
+    const toolMessage = t.models.kai.requests[1].messages.find((m) => m.role === 'tool')!;
+    assert.match(toolMessage.content, /^error: "nowhere.md" does not exist/);
   });
 
   test('on boot, an action released before a crash is re-run only if its tool dedupes by key', async () => {
@@ -343,19 +370,22 @@ describe('agent port and the final-action executor', () => {
     };
     // The email's effect happened before the crash; its result was never recorded.
     const mail = released('email.send', 'mail-1', EMAIL);
-    await new ToolRegistry(workspaceTools(t.workspace)).executeAction({ tool: 'email.send', input: EMAIL, idempotencyKey: 'mail-1' });
+    const signal = new AbortController().signal;
+    await new ToolRegistry(workspaceTools(t.workspace)).get('email.send')!.run(EMAIL, { idempotencyKey: 'mail-1', signal, credential: () => '' });
+    must(t.engine.recordActionStarted(mail, 'mail-1'));
     const smsTask = released('sms.send', 'sms-1', { to: '+1' });
+    must(t.engine.recordActionStarted(smsTask, 'sms-1'));
     assert.equal(t.engine.pendingActions().length, 2);
 
-    await t.server.recoverActions();
+    await t.server.recover();
     assert.equal(readdirSync(join(t.dir, 'workspace', 'outbox')).length, 1, 'the email is not written twice');
     assert.deepEqual(t.engine.getTask(mail)!.actionResult!.ok, true);
     assert.match(t.engine.getTask(mail)!.actionResult!.detail, /already in the outbox/);
     assert.deepEqual(sms, [], 'a tool that cannot detect a repeat is not re-run');
     assert.deepEqual(t.engine.getTask(smsTask)!.actionResult, { ok: false, detail: 'interrupted before its result was recorded; not retried because "sms.send" cannot detect a repeat. Check it by hand.' });
     assert.deepEqual(t.engine.pendingActions(), []);
-    await t.server.recoverActions();
-    assert.equal(t.types().filter((x) => x.startsWith('action.')).length, 2, 'recovery is idempotent');
+    await t.server.recover();
+    assert.equal(t.types().filter((x) => x === 'action.executed' || x === 'action.failed').length, 2, 'recovery is idempotent');
   });
 });
 
@@ -456,7 +486,7 @@ describe('agent runtime: safety holes found in review', () => {
     assert.equal(closed, false, 'close waits while the action runs');
     finish();
     await closing;
-    assert.deepEqual(t.engine.getTask(task.id)!.actionResult, { ok: true, detail: 'sent' });
+    assert.deepEqual(t.engine.getTask(task.id)!.actionResult, { ok: true, detail: 'sent', attempts: 1 });
     assert.equal(t.logs.some((l) => l.startsWith('FATAL')), false);
     teams = teams.filter((x) => x !== t);
     rmSync(t.dir, { recursive: true, force: true });

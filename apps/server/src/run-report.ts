@@ -14,7 +14,8 @@ export interface RunReport {
     escalations: number;
     reviewedTasks: number;
     firstTryReviewPasses: number;
-    toolCalls: { allowed: number; denied: number; duplicate: number };
+    /** `failed`: allowed calls whose tool then failed (timeout, error, interrupted). */
+    toolCalls: { allowed: number; denied: number; duplicate: number; failed: number };
     /** Every recorded model token: planning, work and review. */
     tokens: number;
   };
@@ -49,7 +50,7 @@ export function buildRunReport(events: readonly EngineEvent[]): RunReport {
   const kinds = new Map<string, string>();
   const goals = new Map<string, RunReport['goals'][number]>();
   const tasks = new Map<string, TaskRow>();
-  const tools = { allowed: 0, denied: 0, duplicate: 0 };
+  const tools = { allowed: 0, denied: 0, duplicate: 0, failed: 0 };
   let tokens = 0;
   let escalations = 0;
 
@@ -114,6 +115,9 @@ export function buildRunReport(events: readonly EngineEvent[]): RunReport {
         break;
       case 'tool.duplicate':
         tools.duplicate += 1;
+        break;
+      case 'tool.failed':
+        tools.failed += 1;
         break;
       case 'task.submitted':
         t!.state = 'review';
@@ -193,7 +197,7 @@ export function formatRunReport(report: RunReport, extras: RunExtras = {}): stri
     `| First-try review pass rate | ${pct(s.firstTryReviewPasses, s.reviewedTasks)} |`,
     `| Tasks done | ${s.tasksDone} of ${s.tasks} |`,
     `| Escalations | ${s.escalations} |`,
-    `| Tool calls (allowed / denied / duplicate) | ${s.toolCalls.allowed} / ${s.toolCalls.denied} / ${s.toolCalls.duplicate} |`,
+    `| Tool calls (allowed / denied / duplicate / failed) | ${s.toolCalls.allowed} / ${s.toolCalls.denied} / ${s.toolCalls.duplicate} / ${s.toolCalls.failed} |`,
     `| Tokens (all agents) | ${s.tokens} |`,
   ];
   if (extras.wallSeconds !== undefined) lines.push(`| Wall time | ${Math.round(extras.wallSeconds)} s |`);

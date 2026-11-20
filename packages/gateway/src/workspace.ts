@@ -1,10 +1,7 @@
 import { createHash } from 'node:crypto';
 import { closeSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import type { ToolExecutor } from './registry.ts';
-
-/** Bad input from the model: reported back to it so it can fix the call. */
-export class ToolInputError extends Error {}
+import { ToolInputError, type ToolExecutor } from './registry.ts';
 
 const MAX_READ_BYTES = 100_000;
 const MAX_WRITE_BYTES = 200_000;

@@ -1,0 +1,13 @@
+{
+  "name": "@ai-company/gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tool gateway: the only code that runs tools. Runs a call only after the engine allows it, records every result, holds credentials, and applies timeouts, retries and rate limits.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@ai-company/core": "0.1.0"
+  }
+}

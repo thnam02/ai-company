@@ -3,14 +3,14 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Workspace, workspaceTools, ToolInputError } from '../src/tools/workspace.ts';
-import { ToolRegistry } from '../src/tools/registry.ts';
+import { Workspace, workspaceTools } from '../src/workspace.ts';
+import { ToolInputError, ToolRegistry } from '../src/registry.ts';
 
 describe('workspace tools', () => {
   let dir: string;
   let ws: Workspace;
   let tools: ToolRegistry;
-  const run = (tool: string, input: unknown, key = `k-${Math.random()}`) => tools.get(tool)!.run(input, { idempotencyKey: key });
+  const run = (tool: string, input: unknown, key = `k-${Math.random()}`) => tools.get(tool)!.run(input, { idempotencyKey: key, signal: new AbortController().signal, credential: () => { throw new Error('no credentials'); } });
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'ai-company-ws-'));

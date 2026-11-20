@@ -1,21 +1,10 @@
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkflowEngine } from '@ai-company/core';
-import { inspect } from 'node:util';
-import {
-  AgentRuntime,
-  ClaudeProvider,
-  OllamaProvider,
-  ToolRegistry,
-  Workspace,
-  parseModelRef,
-  workspaceTools,
-  type AgentModel,
-  type AgentView,
-  type ModelProvider,
-} from '@ai-company/agents';
+import { AgentRuntime, ClaudeProvider, OllamaProvider, parseModelRef, type AgentModel, type AgentView, type ModelProvider } from '@ai-company/agents';
+import { Secret, ToolRegistry, Workspace, loadCredentials, workspaceTools } from '@ai-company/gateway';
 import { createCompanyServer, type CompanyServer } from './app.ts';
-import { bootstrapAgents, buildPolicy, loadCompanyConfig } from './company.ts';
+import { bootstrapAgents, buildPolicy, checkExecutors, loadCompanyConfig } from './company.ts';
 import type { DurableEventStore } from './durable-store.ts';
 import { PostgresEventStore } from './pg-event-store.ts';
 import { SqliteCheckpointStore } from './sqlite-checkpoint-store.ts';
@@ -25,28 +14,7 @@ import { startStuckTimer } from './stuck-timer.ts';
 /** Where the event log lives: a local SQLite file by default, Postgres when DATABASE_URL is set. */
 export type StoreConfig = { kind: 'sqlite'; path: string } | { kind: 'postgres'; databaseUrl: string; schema: string };
 
-/**
- * A credential that cannot be printed by accident: logging, JSON or inspect
- * show "[secret]". Only the provider that needs it calls `reveal()` (invariant 6).
- */
-export class Secret {
-  readonly #value: string;
-  constructor(value: string) {
-    this.#value = value;
-  }
-  reveal(): string {
-    return this.#value;
-  }
-  toString(): string {
-    return '[secret]';
-  }
-  toJSON(): string {
-    return '[secret]';
-  }
-  [inspect.custom](): string {
-    return '[secret]';
-  }
-}
+export { Secret };
 
 export interface AgentsConfig {
   /** On by default; AGENTS=off starts the server without agents. With no goals they stay idle, and if Ollama is down they retry with backoff. */
@@ -60,7 +28,7 @@ export interface AgentsConfig {
 
 export interface BootConfig {
   store: StoreConfig;
-  /** Local data: the SQLite event log (unless Postgres) and agent checkpoints. */
+  /** Local data: the SQLite event log (unless Postgres), agent checkpoints and tool credentials (`credentials.json`). */
   dataDir: string;
   agents: AgentsConfig;
   ceoToken: string;
@@ -158,7 +126,7 @@ export async function openStore(config: StoreConfig): Promise<DurableEventStore>
 /**
  * Boot sequence: load config → take the event-log lock → replay every event
  * into a fresh engine → bring the roster in line with the config → finish or
- * give up on final actions interrupted by a crash → start the stuck timer →
+ * give up on tool calls and final actions interrupted by a crash → start the stuck timer →
  * listen → start the agents (if enabled). State comes only from the log, so a
  * restart after a crash ends up exactly where the last durable event left it.
  */
@@ -178,15 +146,20 @@ export async function boot(config: BootConfig, hooks: BootHooks = {}): Promise<R
     const engine = new WorkflowEngine({ policy: buildPolicy(company), store, limits: company.limits });
     log(`replayed ${store.size} events`);
 
-    // Executors for released final actions, needed even with agents off (a CEO approval releases one).
+    // The gateway runs every tool; it is needed even with agents off (a CEO approval releases a final action).
     const workspace = new Workspace(config.agents.workspaceDir);
     const tools = new ToolRegistry(workspaceTools(workspace));
+    checkExecutors(company, tools);
+    const credentials = loadCredentials(join(config.dataDir, 'credentials.json'));
+    if (credentials.names().length) log(`tool credentials: ${credentials.names().join(', ')}`);
 
     server = createCompanyServer({
       engine,
       store,
       ceoToken: config.ceoToken,
       tools,
+      credentials,
+      toolSettings: company.toolSettings,
       log,
       onFatal: hooks.onFatal ?? (() => process.exit(1)),
     });
@@ -203,7 +176,7 @@ export async function boot(config: BootConfig, hooks: BootHooks = {}): Promise<R
     if (report.updated.length) log(`updated agents from config: ${report.updated.join(', ')}`);
     if (report.retired.length) log(`retired agents (not in config; tools revoked, paused): ${report.retired.join(', ')}`);
 
-    await server.recoverActions();
+    await server.recover();
 
     stopTimer = startStuckTimer({ run, engine, log });
     await new Promise<void>((resolve, reject) => {
@@ -226,8 +199,8 @@ export async function boot(config: BootConfig, hooks: BootHooks = {}): Promise<R
       runtime = new AgentRuntime({
         port: server.agentPort,
         modelFor,
-        tools,
-        workspace,
+        // Read-only: the reviewer reads submitted files; writes happen only through the gateway.
+        workspace: { read: (path) => workspace.read(path) },
         checkpoints,
         roleNotes: company.roleNotes,
         log: (m) => console.error(`[agents] ${m}`),

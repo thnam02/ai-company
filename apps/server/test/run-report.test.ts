@@ -25,6 +25,7 @@ function history() {
   must(engine.start(build.id, 'kai'));
   must(engine.recordStep(build.id, 'kai', 2_000));
   must(engine.requestToolCall(build.id, 'kai', { tool: 'repo.read', input: { path: 'a' }, idempotencyKey: 'k1' }));
+  must(engine.recordToolResult(build.id, 'k1', { ok: false, detail: 'timed out after 30000 ms', attempts: 3 }));
   assert.equal(engine.requestToolCall(build.id, 'kai', { tool: 'email.send', input: {}, idempotencyKey: 'k2' }).ok, false);
   tick(30);
   must(engine.recordStep(build.id, 'kai', 3_000));
@@ -71,7 +72,7 @@ describe('run report', () => {
       escalations: 1,
       reviewedTasks: 2,
       firstTryReviewPasses: 1,
-      toolCalls: { allowed: 1, denied: 1, duplicate: 0 },
+      toolCalls: { allowed: 1, denied: 1, duplicate: 0, failed: 1 },
       tokens: 2_500 + 500 + 2_100 + 6_000 + 4_000,
     });
     assert.deepEqual(report.goals.map((g) => [g.id, g.planAttempts, g.planningTokens, g.reviewTokens]), [

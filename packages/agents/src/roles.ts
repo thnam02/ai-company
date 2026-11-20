@@ -2,9 +2,7 @@ import type { Goal, PlanTask, Task } from '@ai-company/core';
 import type { CheckpointStore } from './checkpoints.ts';
 import { PLAN_SCHEMA, VERDICT_SCHEMA, feedbackMessage, newFenceTag, plannerPrompt, reviewerPrompt, roleMemory, workerSystem, workerTask } from './context.ts';
 import { totalTokens, type ChatMessage, type ChatResult, type ModelOptions, type ModelProvider, type ToolCall, type ToolDefinition } from './model.ts';
-import type { AgentPort, AgentView, CompanyView } from './port.ts';
-import type { ToolRegistry } from './tools/registry.ts';
-import { ToolInputError, type Workspace } from './tools/workspace.ts';
+import type { AgentPort, AgentView, CompanyView, ToolInfo } from './port.ts';
 
 /** The model an agent runs on, resolved from its "<provider>:<model>" ref. */
 export interface AgentModel {
@@ -13,12 +11,16 @@ export interface AgentModel {
   options?: ModelOptions;
 }
 
+/** Reads a workspace file (or lists a folder) for the reviewer; throws if it cannot. */
+export interface FileReader {
+  read(path: string): string;
+}
+
 export interface RoleContext {
   port: AgentPort;
   agent: AgentView;
   model: AgentModel;
-  tools: ToolRegistry;
-  workspace: Workspace;
+  workspace: FileReader;
   checkpoints: CheckpointStore;
   newKey: () => string;
   /** The CEO's notes for this agent's role. */
@@ -30,7 +32,6 @@ export interface RoleContext {
 /** True when the unit changed company state (so the runtime should look again right away). */
 export type Progress = boolean;
 
-const MAX_TOOL_OUTPUT = 20_000;
 const MAX_REVIEW_FILE = 20_000;
 const SUBMIT = 'submit_work';
 const BLOCKED = 'report_blocked';
@@ -95,10 +96,12 @@ export async function runWorker(ctx: RoleContext, task: Task, view: CompanyView)
   if (task.state !== 'working') return progress;
 
   const run = task.startedAt ?? 0;
-  const callable = agent.tools.filter((t) => agent.toolAccess[t] === 'call' && ctx.tools.has(t));
+  // Only tools the gateway on this server can run (they come with an input schema).
+  const runnable = new Map(view.tools.flatMap((t) => (t.runnable ? [[t.name, t.runnable] as const] : [])));
+  const callable = agent.tools.filter((t) => agent.toolAccess[t] === 'call' && runnable.has(t));
   // Final actions only for tools the plan gave this task: the engine refuses any other.
-  const finalTools = agent.tools.filter((t) => agent.toolAccess[t] === 'final' && ctx.tools.has(t) && task.requiredTools.includes(t));
-  const { definitions, toolName } = workerTools(ctx, callable, finalTools);
+  const finalTools = agent.tools.filter((t) => agent.toolAccess[t] === 'final' && runnable.has(t) && task.requiredTools.includes(t));
+  const { definitions, toolName } = workerTools(runnable, callable, finalTools);
 
   // Resume from the checkpoint of this run, adding feedback that arrived since.
   const saved = ctx.checkpoints.load(task.id, agent.id);
@@ -171,26 +174,14 @@ export async function runWorker(ctx: RoleContext, task: Task, view: CompanyView)
   }
 }
 
-/** One tool call: ask the engine first, execute only on a durable `allow`. */
+/** One tool call, handed to the gateway: it asks the engine, runs the tool only on `allow` and records the result. */
 async function useTool(ctx: RoleContext, task: Task, tool: string, input: Record<string, unknown>): Promise<string> {
   if ('_invalidArguments' in input) return 'error: the tool arguments were not valid JSON; call the tool again with a JSON object';
-  const idempotencyKey = ctx.newKey();
-  const decision = await ctx.port.requestToolCall(task.id, ctx.agent.id, { tool, input, idempotencyKey });
-  if (!decision.ok) return `error: ${decision.error}`;
-  if (decision.value.kind !== 'allow') return 'error: this call was already made; it was not run again';
-  const executor = ctx.tools.get(tool);
-  if (!executor) return `error: "${tool}" is allowed but not available in this version`;
-  try {
-    const output = await executor.run(input, { idempotencyKey });
-    return output.length > MAX_TOOL_OUTPUT ? `${output.slice(0, MAX_TOOL_OUTPUT)}\n… (truncated)` : output;
-  } catch (err) {
-    if (err instanceof ToolInputError) return `error: ${err.message}`;
-    ctx.log(`tool ${tool} failed for ${ctx.agent.name}: ${err instanceof Error ? err.message : String(err)}`);
-    return 'error: the tool failed; try again or report_blocked';
-  }
+  const result = await ctx.port.callTool(task.id, ctx.agent.id, tool, input);
+  return result.ok ? result.value : `error: ${result.error}`;
 }
 
-function workerTools(ctx: RoleContext, callable: string[], finalTools: string[]) {
+function workerTools(runnable: Map<string, NonNullable<ToolInfo['runnable']>>, callable: string[], finalTools: string[]) {
   // Model-facing names avoid dots, which some vendors reject.
   const toolName = new Map<string, string>();
   const modelName = (name: string) => {
@@ -199,15 +190,15 @@ function workerTools(ctx: RoleContext, callable: string[], finalTools: string[])
     return safe;
   };
   const definitions: ToolDefinition[] = callable.map((name) => {
-    const e = ctx.tools.get(name)!;
-    return { name: modelName(name), description: e.description, parameters: e.parameters };
+    const t = runnable.get(name)!;
+    return { name: modelName(name), description: t.description, parameters: t.parameters };
   });
   const finalAction = finalTools.length
     ? {
         finalAction: {
           type: 'object',
           description: `Optional. Something to send or publish after review and CEO approval. Tools: ${finalTools
-            .map((t) => `${t} (input: ${JSON.stringify(ctx.tools.get(t)!.parameters)})`)
+            .map((t) => `${t} (input: ${JSON.stringify(runnable.get(t)!.parameters)})`)
             .join('; ')}`,
           properties: { tool: { type: 'string', enum: finalTools }, input: { type: 'object' } },
           required: ['tool', 'input'],

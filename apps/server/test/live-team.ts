@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkflowEngine, type Limits } from '@ai-company/core';
-import { AgentRuntime, MemoryCheckpointStore, OllamaProvider, ToolRegistry, Workspace, workspaceTools } from '@ai-company/agents';
+import { AgentRuntime, MemoryCheckpointStore, OllamaProvider } from '@ai-company/agents';
+import { ToolRegistry, Workspace, workspaceTools } from '@ai-company/gateway';
 import { createCompanyServer, type CompanyServer } from '../src/app.ts';
 import { bootstrapAgents, buildPolicy, parseCompanyConfig } from '../src/company.ts';
 import { MemoryDurableEventStore } from '../src/durable-store.ts';
@@ -64,8 +65,7 @@ export async function liveTeam(options: { ollamaUrl: string; model: string; limi
   const runtime = new AgentRuntime({
     port: server.agentPort,
     modelFor: (a) => ({ provider, model: options.model, options: config.modelOptions[a.id] }),
-    tools,
-    workspace,
+    workspace: { read: (path) => workspace.read(path) },
     checkpoints: new MemoryCheckpointStore(),
     roleNotes: config.roleNotes,
     log,

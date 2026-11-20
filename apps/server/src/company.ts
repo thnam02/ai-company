@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import {
+  DEFAULT_LIMITS,
   PolicyEngine,
   fail,
   ok,
@@ -12,6 +13,7 @@ import {
   type WorkflowEngine,
 } from '@ai-company/core';
 import { parseModelRef, type ModelOptions } from '@ai-company/agents';
+import { DEFAULT_TOOL_SETTINGS, worstCaseCallMs, type ToolRegistry, type ToolSettings } from '@ai-company/gateway';
 
 /**
  * Company configuration: tools with risk tiers, the tier-2 auto-approve list,
@@ -28,7 +30,15 @@ export interface CompanyConfig {
   modelOptions: Record<string, ModelOptions>;
   /** The CEO's notes per role ("how to do this job"), shown to agents with that role. */
   roleNotes: Record<string, string>;
+  /** Per-tool gateway limits (timeout, attempts, rate); defaults for the rest. */
+  toolSettings: Record<string, Partial<ToolSettings>>;
 }
+
+const TOOL_SETTING_CHECKS: Record<keyof ToolSettings, (v: unknown) => boolean> = {
+  timeoutMs: (v) => Number.isInteger(v) && (v as number) >= 100 && (v as number) <= 600_000,
+  maxAttempts: (v) => Number.isInteger(v) && (v as number) >= 1 && (v as number) <= 10,
+  ratePerMinute: (v) => Number.isInteger(v) && (v as number) >= 1 && (v as number) <= 10_000,
+};
 
 const OPTION_CHECKS: Record<keyof ModelOptions, (v: unknown) => boolean> = {
   temperature: (v) => typeof v === 'number' && v >= 0 && v <= 2,
@@ -74,9 +84,20 @@ export function parseCompanyConfig(raw: unknown): CompanyConfig {
   if (!Array.isArray(c.tools)) throw new Error('company config needs a "tools" array');
   if (!Array.isArray(c.agents)) throw new Error('company config needs an "agents" array');
 
+  const toolSettings: Record<string, Partial<ToolSettings>> = {};
   const tools: ToolSpec[] = c.tools.map((t: any, i: number) => {
     if (typeof t?.name !== 'string' || !t.name) throw new Error(`tools[${i}] needs a name`);
     if (![0, 1, 2, 3].includes(t.tier)) throw new Error(`tool "${t.name}" needs a tier of 0, 1, 2 or 3`);
+    for (const key of Object.keys(t)) {
+      if (!['name', 'tier', 'description', ...Object.keys(TOOL_SETTING_CHECKS)].includes(key)) {
+        throw new Error(`tool "${t.name}" has unknown field "${key}" (description, timeoutMs, maxAttempts, ratePerMinute)`);
+      }
+    }
+    for (const [key, check] of Object.entries(TOOL_SETTING_CHECKS) as [keyof ToolSettings, (v: unknown) => boolean][]) {
+      if (t[key] === undefined) continue;
+      if (!check(t[key])) throw new Error(`tool "${t.name}" ${key} is out of range`);
+      (toolSettings[t.name] ??= {})[key] = t[key];
+    }
     return { name: t.name, tier: t.tier as RiskTier, ...(typeof t.description === 'string' ? { description: t.description } : {}) };
   });
 
@@ -126,9 +147,35 @@ export function parseCompanyConfig(raw: unknown): CompanyConfig {
     }
   }
 
-  const config: CompanyConfig = { tools, autoApproveTier2: [...autoApproveTier2], limits, agents, modelOptions, roleNotes };
+  // A call (every attempt, backoff and rate-limit wait) must end before the
+  // stuck timer could escalate its task for silence. Other limits (wall time,
+  // budget) can still end a task mid-call; its result is then recorded late.
+  const stuckAfterMs = limits.stuckAfterMs ?? DEFAULT_LIMITS.stuckAfterMs;
+  for (const t of tools) {
+    const worst = worstCaseCallMs({ ...DEFAULT_TOOL_SETTINGS, ...toolSettings[t.name] });
+    if (worst >= stuckAfterMs) {
+      throw new Error(`tool "${t.name}": one call can take up to ${worst} ms with its timeout, attempts and rate limit; it must be under the stuckAfterMs limit (${stuckAfterMs})`);
+    }
+  }
+
+  const config: CompanyConfig = { tools, autoApproveTier2: [...autoApproveTier2], limits, agents, modelOptions, roleNotes, toolSettings };
   buildPolicy(config); // throws on duplicate tools or a bad auto-approve entry
   return config;
+}
+
+/**
+ * Checks the config against the tools this server can run. An auto-approved
+ * tier-2 tool runs during work, and a worker's turn redone after a crash gets
+ * new keys, so until pending calls are checkpointed with their keys (ADR
+ * 0004) only a tool that dedupes by key may be auto-approved.
+ */
+export function checkExecutors(config: CompanyConfig, tools: ToolRegistry): void {
+  for (const name of config.autoApproveTier2) {
+    const executor = tools.get(name);
+    if (executor && !executor.dedupesByKey) {
+      throw new Error(`"${name}" is auto-approved but cannot detect a repeated call; remove it from autoApproveTier2 (ADR 0004)`);
+    }
+  }
 }
 
 export function buildPolicy(config: CompanyConfig): PolicyEngine {

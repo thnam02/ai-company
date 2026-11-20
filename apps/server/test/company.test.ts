@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WorkflowEngine } from '@ai-company/core';
-import { bootstrapAgents, buildPolicy, loadCompanyConfig, parseCompanyConfig } from '../src/company.ts';
+import { ToolRegistry } from '@ai-company/gateway';
+import { bootstrapAgents, buildPolicy, checkExecutors, loadCompanyConfig, parseCompanyConfig } from '../src/company.ts';
 import { DEFAULT_COMPANY_CONFIG, configFromEnv } from '../src/boot.ts';
 import { MemoryDurableEventStore } from '../src/durable-store.ts';
 import { TEST_CONFIG, must } from './helpers.ts';
@@ -28,12 +29,38 @@ describe('company config', () => {
       ['duplicate agent', (c) => c.agents.push(c.agents[0]), /duplicate agent/],
       ['unknown kind', (c) => (c.agents[0].kind = 'ceo'), /unknown kind/],
       ['agent with an unknown tool', (c) => c.agents[1].tools.push('laser'), /unknown tools: laser/],
+      ['a typo in a tool field', (c) => (c.tools[0].timeout = 5), /unknown field "timeout"/],
+      ['a timeout too short', (c) => (c.tools[0].timeoutMs = 10), /timeoutMs is out of range/],
+      ['too many attempts', (c) => (c.tools[0].maxAttempts = 50), /maxAttempts is out of range/],
+      ['a fractional rate', (c) => (c.tools[0].ratePerMinute = 1.5), /ratePerMinute is out of range/],
+      ['a call that can outlast the stuck timer', (c) => Object.assign(c.tools[0], { timeoutMs: 120_000, maxAttempts: 3 }), /must be under the stuckAfterMs limit/],
+      ['backoff pushes a call past the stuck timer', (c) => Object.assign(c.tools[0], { timeoutMs: 29_000, maxAttempts: 10 }), /up to 3\d\d\d\d\d ms/],
+      ['rate-limit waits push a call past the stuck timer', (c) => Object.assign(c.tools[0], { timeoutMs: 50_000, maxAttempts: 3, ratePerMinute: 5 }), /stuckAfterMs/],
     ];
     for (const [name, mutate, error] of cases) {
       const c = base();
       mutate(c);
       assert.throws(() => parseCompanyConfig(c), error, name);
     }
+  });
+
+  test('per-tool gateway limits come from the config and stay out of the policy', () => {
+    const c = base();
+    Object.assign(c.tools[0], { timeoutMs: 5_000, ratePerMinute: 30 });
+    const config = parseCompanyConfig(c);
+    assert.deepEqual(config.toolSettings, { [c.tools[0].name]: { timeoutMs: 5_000, ratePerMinute: 30 } });
+    assert.deepEqual(buildPolicy(config).listTools()[0], { name: c.tools[0].name, tier: c.tools[0].tier });
+  });
+
+  test('an auto-approved tool must dedupe by key, since a redone turn uses new keys', () => {
+    const c = base();
+    const config = parseCompanyConfig(c);
+    const tier2 = config.autoApproveTier2[0];
+    assert.ok(tier2, 'the test config auto-approves a tier-2 tool');
+    const executor = (dedupesByKey: boolean) => new ToolRegistry([{ name: tier2, description: '', parameters: {}, dedupesByKey, run: async () => '' }]);
+    assert.throws(() => checkExecutors(config, executor(false)), /cannot detect a repeated call/);
+    assert.doesNotThrow(() => checkExecutors(config, executor(true)));
+    assert.doesNotThrow(() => checkExecutors(config, new ToolRegistry()), 'no executor yet: nothing can run');
   });
 
   test('bootstrap registers new agents and applies config changes through the engine', () => {

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import type { AddressInfo } from 'node:net';
 import { WorkflowEngine, type ProposedAction } from '@ai-company/core';
 import WebSocket from 'ws';
+import { ToolRegistry, type ToolExecutor } from '@ai-company/gateway';
 import { createCompanyServer, type CompanyServer, type ServerOptions } from '../src/app.ts';
 import { MemoryDurableEventStore, type DurableEventStore } from '../src/durable-store.ts';
 import { allMet, makePolicy, must, registerTestAgents } from './helpers.ts';
@@ -21,6 +22,24 @@ interface Harness {
 
 let open: Harness[] = [];
 
+async function waitFor(cond: () => boolean): Promise<void> {
+  while (!cond()) await new Promise((r) => setTimeout(r, 5));
+}
+
+/** A fake email.send that records what it was asked to send. */
+function fakeEmail(executed: ProposedAction[], run?: () => Promise<string>): ToolExecutor {
+  return {
+    name: 'email.send',
+    description: 'fake',
+    parameters: { type: 'object' },
+    dedupesByKey: true,
+    run: async (input, ctx) => {
+      executed.push({ tool: 'email.send', input, idempotencyKey: ctx.idempotencyKey });
+      return run ? run() : 'sent';
+    },
+  };
+}
+
 async function start(store: DurableEventStore = new MemoryDurableEventStore(), overrides: Partial<ServerOptions> = {}): Promise<Harness> {
   const engine = new WorkflowEngine({ policy: makePolicy(), store });
   registerTestAgents(engine);
@@ -32,9 +51,7 @@ async function start(store: DurableEventStore = new MemoryDurableEventStore(), o
     engine,
     store,
     ceoToken: TOKEN,
-    onExecute: (action) => {
-      executed.push(action);
-    },
+    tools: new ToolRegistry([fakeEmail(executed)]),
     onFatal: (err) => fatal.push(err),
     log: (m) => logs.push(m),
     ...overrides,
@@ -145,12 +162,14 @@ describe('CEO actions', () => {
     assert.equal(engine.start(t.id, 'kai').ok, true);
   });
 
-  test('approving releases the final action to the gateway hook once, never to the HTTP caller', async () => {
+  test('approving releases the final action to the gateway once, never to the HTTP caller', async () => {
     const { call, engine, executed } = await start();
     const taskId = taskAwaitingApproval(engine);
     const res = await call('POST', `/tasks/${taskId}/approval`, { approved: true });
     assert.equal(res.status, 200);
     assert.deepEqual(res.body, { state: 'done' });
+    await waitFor(() => engine.getTask(taskId)!.actionResult !== null);
+    assert.deepEqual(engine.getTask(taskId)!.actionResult, { ok: true, detail: 'sent', attempts: 1 });
     assert.deepEqual(executed, [{ tool: 'email.send', input: { to: 'client' }, idempotencyKey: 'mail-1' }]);
     const again = await call('POST', `/tasks/${taskId}/approval`, { approved: true });
     assert.equal(again.status, 409);
@@ -217,10 +236,6 @@ describe('durability ordering', () => {
       return new Promise((resolve, reject) => this.gates.push({ resolve, reject }));
     }
   }
-  const waitFor = async (cond: () => boolean) => {
-    while (!cond()) await new Promise((r) => setTimeout(r, 5));
-  };
-
   test('no response leaves before its events are durable', async () => {
     const store = new GatedStore();
     const { call } = await start(store);
@@ -306,24 +321,40 @@ describe('store failure', () => {
   });
 });
 
-describe('gateway hook', () => {
-  test('a throwing hook does not undo or fail the approval, and is logged', async () => {
-    const { call, engine, logs } = await start(undefined, {
-      onExecute: () => {
-        throw new Error('gateway down');
-      },
-    });
+describe('gateway', () => {
+  test('a tool that fails does not undo or fail the approval; the failure is recorded and logged', async () => {
+    const executed: ProposedAction[] = [];
+    const down = async (): Promise<string> => {
+      throw new Error('gateway down');
+    };
+    const { call, engine, logs } = await start(undefined, { tools: new ToolRegistry([fakeEmail(executed, down)]) });
     const taskId = taskAwaitingApproval(engine);
     assert.deepEqual((await call('POST', `/tasks/${taskId}/approval`, { approved: true })).body, { state: 'done' });
-    await new Promise((r) => setImmediate(r));
-    assert.ok(logs.some((l) => /gateway hook failed for mail-1: gateway down/.test(l)));
+    await waitFor(() => engine.getTask(taskId)!.actionResult !== null);
+    assert.deepEqual(engine.getTask(taskId)!.actionResult, { ok: false, detail: 'gateway down', attempts: 1 });
+    assert.ok(logs.some((l) => /final action email.send for task .* failed: gateway down/.test(l)));
   });
 
-  test('without executors the released action is only logged, never returned', async () => {
-    const { call, engine, logs } = await start(undefined, { onExecute: undefined });
+  test('an approval given while the kill switch is on runs only after resume', async () => {
+    const { call, engine, executed } = await start();
+    const taskId = taskAwaitingApproval(engine);
+    assert.equal((await call('POST', '/company/pause')).status, 200);
+    assert.deepEqual((await call('POST', `/tasks/${taskId}/approval`, { approved: true })).body, { state: 'done' });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.deepEqual(executed, [], 'nothing runs while paused');
+    assert.equal(engine.getTask(taskId)!.actionResult, null, 'held, not failed');
+    assert.equal((await call('POST', '/company/resume')).status, 200);
+    await waitFor(() => engine.getTask(taskId)!.actionResult !== null);
+    assert.equal(executed.length, 1);
+    assert.equal(engine.getTask(taskId)!.actionResult!.ok, true);
+  });
+
+  test('without an executor the released action is recorded as failed, never returned', async () => {
+    const { call, engine } = await start(undefined, { tools: new ToolRegistry() });
     const taskId = taskAwaitingApproval(engine);
     const res = await call('POST', `/tasks/${taskId}/approval`, { approved: true });
     assert.deepEqual(res.body, { state: 'done' });
-    assert.ok(logs.some((l) => /email.send \(mail-1\).*no executors are configured/.test(l)));
+    await waitFor(() => engine.getTask(taskId)!.actionResult !== null);
+    assert.match(engine.getTask(taskId)!.actionResult!.detail, /no executor for "email.send"/);
   });
 });

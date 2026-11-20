@@ -1,7 +1,8 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { fail, ok, type Outcome, type PlanTask, type ProposedAction, type Resolution, type Result, type ReviewVerdict, type Submission, type TaskState, type WorkflowEngine } from '@ai-company/core';
-import type { AgentPort, AgentView, CompanyView, ToolAccess, ToolRegistry } from '@ai-company/agents';
+import { fail, ok, type Outcome, type PlanTask, type Resolution, type Result, type ReviewVerdict, type Submission, type TaskState, type WorkflowEngine } from '@ai-company/core';
+import type { AgentPort, AgentView, CompanyView, ToolAccess } from '@ai-company/agents';
+import { ToolGateway, ToolRegistry, type CredentialStore, type GatewayOptions, type ToolSettings } from '@ai-company/gateway';
 import type { DurableEventStore } from './durable-store.ts';
 import { attachEventStream, type EventStream } from './stream.ts';
 
@@ -12,17 +13,17 @@ export interface ServerOptions {
   /** Bearer token for the CEO. Never logged, never put in events. */
   ceoToken: string;
   /**
-   * Executors for released final actions (ADR 0003). A released action is
-   * executed only after its release is durable, and its result is recorded
-   * through the engine (`action.executed` / `action.failed`). Never sent to
-   * the HTTP caller.
+   * The tools the gateway can run (ADR 0004): agents' calls and released
+   * final actions. A tool with no executor here is recorded as failed when
+   * used. Results are recorded through the engine, never sent to the HTTP caller.
    */
   tools?: ToolRegistry;
-  /**
-   * Test hook used instead of `tools`: receives released final actions after
-   * the release is durable. Nothing is recorded for them.
-   */
-  onExecute?: (action: ProposedAction, context: { taskId: string }) => void | Promise<void>;
+  /** Tool credentials, held by the gateway only (invariant 6). */
+  credentials?: CredentialStore;
+  /** Per-tool timeout, attempts and rate limit from the company config. */
+  toolSettings?: Record<string, Partial<ToolSettings>>;
+  /** Test hooks for the gateway (clock, sleep, keys). */
+  gatewayHooks?: Pick<GatewayOptions, 'now' | 'sleep' | 'random' | 'newKey'>;
   /** Called once if the event store fails. The process should exit and rebuild from the log. */
   onFatal?: (err: Error) => void;
   log?: (message: string) => void;
@@ -46,10 +47,11 @@ export interface CompanyServer {
   /** The only way agents reach the company: allowlisted engine commands through `run` (ADR 0003). */
   readonly agentPort: AgentPort;
   /**
-   * The outbox after a crash: executes (or gives up on) every released final
-   * action with no recorded result. Call once on boot, before agents start.
+   * After a crash: records interrupted tool calls as failed and executes (or
+   * gives up on) every released final action with no recorded result. Call
+   * once on boot, before agents start.
    */
-  recoverActions(): Promise<void>;
+  recover(): Promise<void>;
   /** True once the store has failed; the server then refuses all work. */
   readonly failed: boolean;
   close(): Promise<void>;
@@ -119,82 +121,39 @@ export function createCompanyServer(options: ServerOptions): CompanyServer {
     return r.value;
   };
 
-  /** Final actions running now, by idempotency key; `close()` waits for them. */
-  const executing = new Map<string, Promise<void>>();
+  // The tool gateway reaches the engine only through the command queue, so
+  // it runs a tool only once the `allow` (or the release) is durable.
+  const gateway = new ToolGateway({
+    engine: {
+      requestToolCall: (taskId, agentId, call) => run(() => engine.requestToolCall(taskId, agentId, call)),
+      recordToolResult: (taskId, key, result) => run(() => engine.recordToolResult(taskId, key, result)),
+      recordActionResult: (taskId, key, result) => run(() => engine.recordActionResult(taskId, key, result)),
+      recordActionStarted: (taskId, key) => run(() => engine.recordActionStarted(taskId, key)),
+      pendingToolCalls: () => run(() => engine.pendingToolCalls()),
+      pendingActions: () => run(() => engine.pendingActions()),
+      isPaused: () => run(() => engine.isCompanyPaused()),
+    },
+    tools: options.tools ?? new ToolRegistry(),
+    ...(options.credentials ? { credentials: options.credentials } : {}),
+    ...(options.toolSettings ? { settings: options.toolSettings } : {}),
+    ...options.gatewayHooks,
+    log: (m) => log(`[gateway] ${m}`),
+  });
 
-  /**
-   * Executes a released final action and records its result through the
-   * engine. Called only after the release is durable. A key already being
-   * executed in this process is skipped; across a crash, recoverActions decides.
-   */
-  const execute = (action: ProposedAction, taskId: string, tools: ToolRegistry): Promise<void> => {
-    const key = action.idempotencyKey;
-    const running = executing.get(key);
-    if (running) return running;
-    const done = executeOnce(action, taskId, tools).finally(() => executing.delete(key));
-    executing.set(key, done);
-    return done;
-  };
-
-  const executeOnce = async (action: ProposedAction, taskId: string, tools: ToolRegistry): Promise<void> => {
-    const key = action.idempotencyKey;
-    try {
-      const result = await tools.executeAction(action);
-      const recorded = await run(() => engine.recordActionResult(taskId, key, result));
-      if (!recorded.ok) log(`could not record the result of ${action.tool} for task ${taskId}: ${recorded.error}`);
-      else log(`final action ${action.tool} for task ${taskId} ${result.ok ? 'done' : 'failed'}: ${result.detail}`);
-    } catch (err) {
-      // `run` failing means the server has gone fatal; the action stays pending for the next boot.
-      log(`final action ${action.tool} for task ${taskId} was not recorded: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  };
-
-  /** Hands a released action to the executor without making the caller wait for it. */
+  /** Hands a released action (durable by now) to the gateway without making the caller wait. */
   const release = (outcome: Outcome, taskId: string): void => {
-    const action = outcome.execute;
-    if (!action) return;
-    if (options.tools) {
-      void execute(action, taskId, options.tools);
-      return;
-    }
-    if (!options.onExecute) {
-      log(`final action ${action.tool} (${action.idempotencyKey}) for task ${taskId} is released, but no executors are configured; it was not executed`);
-      return;
-    }
-    const failed = (err: unknown) => log(`gateway hook failed for ${action.idempotencyKey}: ${err instanceof Error ? err.message : String(err)}`);
-    try {
-      Promise.resolve(options.onExecute(action, { taskId })).catch(failed);
-    } catch (err) {
-      failed(err);
-    }
-  };
-
-  const recoverActions = async (): Promise<void> => {
-    const tools = options.tools;
-    if (!tools) return;
-    const pending = await run(() => engine.pendingActions());
-    for (const { taskId, action } of pending) {
-      const executor = tools.get(action.tool);
-      if (executor && !executor.dedupesByKey) {
-        // It may already have run: running it again could do it twice.
-        const detail = `interrupted before its result was recorded; not retried because "${action.tool}" cannot detect a repeat. Check it by hand.`;
-        const recorded = await run(() => engine.recordActionResult(taskId, action.idempotencyKey, { ok: false, detail }));
-        log(recorded.ok ? `final action ${action.tool} for task ${taskId}: ${detail}` : `could not record ${action.tool} for task ${taskId}: ${recorded.error}`);
-      } else {
-        await execute(action, taskId, tools);
-      }
-    }
+    if (outcome.execute) void gateway.release(taskId, outcome.execute);
   };
 
   // Allowlisted agent commands (ADR 0003). Each runs through the command
   // queue, so an agent sees a result (e.g. a tool `allow`) only once it is durable.
   const agentPort: AgentPort = Object.freeze({
-    view: () => run(() => agentView(engine)),
+    view: () => run(() => agentView(engine, gateway)),
     submitPlan: (goalId: string, orchestratorId: string, plan: PlanTask[]) => run(() => engine.submitPlan(goalId, orchestratorId, plan)),
     start: (taskId: string, agentId: string) => run(() => engine.start(taskId, agentId)),
     recordStep: (taskId: string, agentId: string, tokens: number) => run(() => engine.recordStep(taskId, agentId, tokens)),
     recordGoalStep: (goalId: string, agentId: string, tokens: number) => run(() => engine.recordGoalStep(goalId, agentId, tokens)),
-    requestToolCall: (taskId: string, agentId: string, call: ProposedAction) => run(() => engine.requestToolCall(taskId, agentId, call)),
+    callTool: (taskId: string, agentId: string, tool: string, input: unknown) => gateway.call(taskId, agentId, tool, input),
     submitForReview: (taskId: string, agentId: string, submission: Submission) => run(() => engine.submitForReview(taskId, agentId, submission)),
     recordReview: async (taskId: string, reviewerId: string, verdict: ReviewVerdict): Promise<Result<TaskState>> => {
       const r = await run(() => engine.recordReview(taskId, reviewerId, verdict));
@@ -274,6 +233,8 @@ export function createCompanyServer(options: ServerOptions): CompanyServer {
           const r = action === 'pause' ? engine.pauseCompany(body.reason || undefined) : engine.resumeCompany();
           return r.ok ? ok(engine.isCompanyPaused()) : r;
         });
+        // Final actions approved while paused were held; they run now.
+        if (!companyPaused) gateway.resume().catch((err) => log(`[gateway] could not resume held actions: ${err instanceof Error ? err.message : String(err)}`));
         return { body: { companyPaused } };
       },
     ],
@@ -321,14 +282,14 @@ export function createCompanyServer(options: ServerOptions): CompanyServer {
     stream,
     run,
     agentPort,
-    recoverActions,
+    recover: () => gateway.recover(),
     get failed() {
       return failure !== null;
     },
     async close() {
-      // A released action that is running finishes and records its result
-      // before the server (and then the store) closes.
-      await Promise.allSettled([...executing.values()]);
+      // Tool calls and released actions that are running finish and record
+      // their results before the server (and then the store) closes.
+      await gateway.close();
       await stream.close();
       await new Promise<void>((resolve) => {
         http.close(() => resolve());
@@ -349,8 +310,11 @@ export function snapshot(engine: WorkflowEngine) {
   };
 }
 
-/** What agents may see: the snapshot plus, per agent, what policy lets it do with each tool. */
-function agentView(engine: WorkflowEngine): CompanyView {
+/**
+ * What agents may see: the snapshot plus, per agent, what policy lets it do
+ * with each tool, and the input schema of every tool the gateway can run.
+ */
+function agentView(engine: WorkflowEngine, gateway: ToolGateway): CompanyView {
   const agents: AgentView[] = engine.listAgents().map((a) => {
     const toolAccess: Record<string, ToolAccess> = {};
     for (const tool of a.tools) {
@@ -360,7 +324,12 @@ function agentView(engine: WorkflowEngine): CompanyView {
     }
     return { ...a, toolAccess };
   });
-  return { ...snapshot(engine), agents, tools: engine.policy.listTools() };
+  const schemas = new Map(gateway.describe().map((t) => [t.name, t]));
+  const tools = engine.policy.listTools().map((t) => {
+    const runnable = schemas.get(t.name);
+    return runnable ? { ...t, runnable: { description: runnable.description, parameters: runnable.parameters } } : t;
+  });
+  return { ...snapshot(engine), agents, tools };
 }
 
 function parseResolution(body: any): Resolution {

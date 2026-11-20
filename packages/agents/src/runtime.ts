@@ -2,16 +2,14 @@ import { randomUUID } from 'node:crypto';
 import type { Task } from '@ai-company/core';
 import type { CheckpointStore } from './checkpoints.ts';
 import type { AgentPort, AgentView, CompanyView } from './port.ts';
-import { runPlanner, runReviewer, runWorker, type AgentModel, type Progress, type RoleContext } from './roles.ts';
-import type { ToolRegistry } from './tools/registry.ts';
-import type { Workspace } from './tools/workspace.ts';
+import { runPlanner, runReviewer, runWorker, type AgentModel, type FileReader, type Progress, type RoleContext } from './roles.ts';
 
 export interface RuntimeOptions {
   port: AgentPort;
   /** The model for an agent, or undefined if its provider is not available. */
   modelFor: (agent: AgentView) => AgentModel | undefined;
-  tools: ToolRegistry;
-  workspace: Workspace;
+  /** Reads the files a submission names, for the reviewer. Tools are run only by the gateway, through the port. */
+  workspace: FileReader;
   checkpoints: CheckpointStore;
   log?: (message: string) => void;
   /** Wait between looks when there is nothing to do. Default 1 s. */
@@ -138,7 +136,6 @@ export class AgentRuntime {
       port: this.options.port,
       agent,
       model,
-      tools: this.options.tools,
       workspace: this.options.workspace,
       checkpoints: this.options.checkpoints,
       newKey: this.options.newKey ?? (() => randomUUID()),

@@ -1,6 +1,6 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -68,6 +68,18 @@ describe('booting with agents', () => {
     assert.equal(configFromEnv({ ...base, WORKSPACE_DIR: '/srv/co/database' }).agents.workspaceDir, '/srv/co/database', 'a sibling with a shared prefix is fine');
     // The repo defaults never overlap.
     assert.doesNotThrow(() => configFromEnv({ CEO_TOKEN: TOKEN }));
+  });
+
+  test('tool credentials come from DATA_DIR/credentials.json, which only its owner may read', async () => {
+    const config = configFromEnv({ CEO_TOKEN: TOKEN, AGENTS: 'off', DATA_DIR: join(dir, 'data'), WORKSPACE_DIR: join(dir, 'workspace'), COMPANY_CONFIG: TEST_TEAM, PORT: '0' });
+    const path = join(dir, 'data', 'credentials.json');
+    mkdirSync(join(dir, 'data'), { recursive: true });
+    writeFileSync(path, JSON.stringify({ smtp: 'smtp-password-123456' }));
+    chmodSync(path, 0o644);
+    await assert.rejects(boot(config, { onFatal: () => {} }), /other users; run: chmod 600/);
+    chmodSync(path, 0o600);
+    const running = await boot(config, { onFatal: () => {} });
+    await running.stop();
   });
 
   test('checkpoints survive a restart, and only one server may hold the file', () => {

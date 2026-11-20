@@ -2,7 +2,7 @@
   "name": "@ai-company/server",
   "version": "0.1.0",
   "private": true,
-  "description": "Control-plane server: SQLite or Postgres event store, CEO HTTP API and WebSocket event stream.",
+  "description": "Control-plane server: SQLite or Postgres event store, CEO HTTP API, WebSocket event stream, and the tool gateway wired to the engine.",
   "type": "module",
   "scripts": {
     "start": "node src/main.ts"
@@ -10,6 +10,7 @@
   "dependencies": {
     "@ai-company/agents": "0.1.0",
     "@ai-company/core": "0.1.0",
+    "@ai-company/gateway": "0.1.0",
     "better-sqlite3": "^13.2.0",
     "pg": "^8.23.1",
     "ws": "^8.23.0"

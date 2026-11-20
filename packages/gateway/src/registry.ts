@@ -1,10 +1,32 @@
-import type { ActionResult, ProposedAction } from '@ai-company/core';
-import type { JsonSchema } from '../model.ts';
+/** A JSON schema object, shown to models as a tool's input format. */
+export type JsonSchema = Record<string, unknown>;
+
+/** Bad input from the model: reported back to it so it can fix the call. Never retried. */
+export class ToolInputError extends Error {}
 
 /**
- * Code that performs one tool's real-world effect. It runs only after the
- * engine allowed the call (or released the final action) and that decision
- * is durable. It never decides whether it may run.
+ * A temporary failure that happened before the tool had any effect (a 429, a
+ * 503, a refused connection), so trying again is safe. The gateway retries
+ * these with backoff; every other error is final.
+ */
+export class TransientToolError extends Error {}
+
+export interface ToolRunContext {
+  /** Unique per real-world effect: pass it to services that dedupe by key. */
+  idempotencyKey: string;
+  /** Aborted when this attempt times out. (Stopping the server waits for running calls instead.) */
+  signal: AbortSignal;
+  /**
+   * The value of a credential this tool declared in `credentials`. Throws for
+   * any other name. Use it only to call the service: never put it in output.
+   */
+  credential(name: string): string;
+}
+
+/**
+ * Code that performs one tool's real-world effect. Only the gateway runs it,
+ * after the engine allowed the call (or released the final action) and that
+ * decision is durable. It never decides whether it may run.
  */
 export interface ToolExecutor {
   name: string;
@@ -13,11 +35,21 @@ export interface ToolExecutor {
   parameters: JsonSchema;
   /**
    * True if running the same idempotency key twice has the effect of running
-   * it once. Only such actions are re-run after a crash (ADR 0003).
+   * it once. Only such tools are retried after a timeout or re-run after a
+   * crash (ADR 0003, ADR 0004).
    */
   dedupesByKey: boolean;
-  /** Returns text for the model. Throws ToolInputError for bad input. */
-  run(input: unknown, ctx: { idempotencyKey: string }): Promise<string>;
+  /** Names of the server-side credentials this tool needs. */
+  credentials?: string[];
+  /** Returns text for the model. Throws ToolInputError for bad input, TransientToolError for a safe-to-retry failure. */
+  run(input: unknown, ctx: ToolRunContext): Promise<string>;
+}
+
+/** What agents may know about a tool: never its code or credentials. */
+export interface ToolDescription {
+  name: string;
+  description: string;
+  parameters: JsonSchema;
 }
 
 export class ToolRegistry {
@@ -42,14 +74,7 @@ export class ToolRegistry {
     return [...this.tools.values()];
   }
 
-  /** Executes a released final action. Never throws: failures become a recorded result. */
-  async executeAction(action: ProposedAction): Promise<ActionResult> {
-    const tool = this.tools.get(action.tool);
-    if (!tool) return { ok: false, detail: `no executor for "${action.tool}" yet; nothing was done` };
-    try {
-      return { ok: true, detail: await tool.run(action.input, { idempotencyKey: action.idempotencyKey }) };
-    } catch (err) {
-      return { ok: false, detail: err instanceof Error ? err.message : String(err) };
-    }
+  describe(): ToolDescription[] {
+    return this.list().map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
   }
 }
