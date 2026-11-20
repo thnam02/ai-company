@@ -121,11 +121,19 @@ Round 2 (manual comparison, not required for M3): the same goal with Ava and Rex
 - [x] 36 new tests: 199 in total with Postgres, 184 without (core 62, agents 14, gateway 30, server 93, or 78 without Postgres). The retry rule, the pause guard and the start record are mutation-checked. The live goal test still passes on `qwen3:8b` (500 s, [run report](runs/2026-11-20-qwen3-8b.md#m4-the-same-goal-through-the-tool-gateway))
 - [ ] Carried forward (ADR 0003, ADR 0004): a worker's turn redone after a crash gets new keys. Checkpoint the pending call and its key before `callTool`, so the redo reuses the key. Until then, boot refuses to auto-approve a tier-2 tool that does not dedupe
 
-## [ ] M5 · Reviewer and automated checks
+## [x] M5 · Reviewer and automated checks
 
-- [ ] Reviewer agent with a rubric built from acceptance criteria; outputs `ReviewVerdict` JSON
-- [ ] Automated checks per output type run before the reviewer (tests/lint/build for code; links/length for content)
-- [ ] Rework loop and escalation verified end to end
+- [x] Reviewer agent with a rubric built from acceptance criteria; outputs `ReviewVerdict` JSON. The model judges each criterion with evidence; code sets `passed` and `score`, and the engine (`strictReview`) refuses a rubric that skips or repeats a criterion or contradicts the verdict ([ADR 0005](decisions/0005-checks-and-rubric-review.md))
+- [x] Automated checks per output type run before the reviewer: files exist, length, placeholders and links for content; schema, recipient allowlist, body length and links for emails. Recorded through `recordChecks`; a failure sends the work back and counts as a review attempt; rules are the CEO's `checks` config
+- [ ] Code checks (tests, lint, build): deferred to M7, because they run agent-written code and need a sandbox first
+- [x] Rework loop and escalation verified end to end: failed checks → rework → checks pass → rubric review; an off-allowlist email escalates after 3 failed check runs with no reviewer turn; a submission left unchecked by a crash is checked on boot before any review; a file changed after its checks is checked again before a review counts
+- [x] Hardened after two reviews:
+  - Rubric matching: each criterion must be judged exactly once, and malformed items are never dropped, so a reworded item cannot turn a "not met" into a pass.
+  - Checks: patterns stay linear on agent text; reads are capped per file, per submission and per text.
+  - Engine input: rubric notes are type-checked; the engine computes the score; plans with blank or repeated criteria are refused.
+  - Ordering and file changes: results name their submission; files are hashed and compared in the same command that records the review; files that keep changing escalate.
+  - Kill switch: it holds checks too.
+- [x] 32 new tests: 216 in total without Postgres, 231 with (core 71, agents 18, gateway 42, server 85 without Postgres). The key guards are mutation-checked. Live on `qwen3:8b` the gates worked in all three goal runs: two check failures were sent back and fixed, and every verdict was computed from the rubric. The goal test passed once. Two runs on the final code failed on model output: a plan without the email's dependency, and an email task submitted without its `email.send` action. Impossible criteria escalated ([run report](runs/2026-11-20-qwen3-8b.md#m5-checks-and-rubric-reviews))
 
 ## [ ] M6 · 3D office on real data (`apps/office`)
 
@@ -136,6 +144,7 @@ Round 2 (manual comparison, not required for M3): the same goal with Ava and Rex
 ## [ ] M7 · More departments
 
 - [ ] Marketing, Sales and Support role templates and tools (with tier tags)
+- [ ] Code checks before review (tests, lint, build) in a sandbox: no network, resource limits, a throwaway copy of the workspace (deferred from M5)
 - [ ] Tier-3 email and publishing flows through the approval gate
 
 ## [ ] M8 · Improvement loop

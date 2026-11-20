@@ -8,11 +8,12 @@ The core rule: **LLMs propose, deterministic code decides.** Agents can't change
 
 | Part | Where | Status |
 | --- | --- | --- |
-| Control plane: workflow engine, policy, limits, event log | `packages/core` | ✅ Done, 62 tests |
+| Control plane: workflow engine, policy, limits, event log | `packages/core` | ✅ Done, 71 tests |
 | 3D office UI | `apps/office` | 🟡 Prototype with simulated agents |
-| Server, SQLite or Postgres, WebSocket | `apps/server` | ✅ Done, 93 tests |
-| Agent runtime: orchestrator, workers, reviewer on Ollama or Claude models | `packages/agents` | ✅ Done, 14 tests plus end-to-end server tests with scripted models (M3a); the test team passes live on `qwen3:8b` (M3b) |
-| Tool gateway: runs every tool after the engine allows it, records results, holds credentials, timeouts, retries, rate limits | `packages/gateway` | ✅ Done, 30 tests (M4) |
+| Server, SQLite or Postgres, WebSocket | `apps/server` | ✅ Done, 100 tests (85 without Postgres) |
+| Agent runtime: orchestrator, workers, reviewer on Ollama or Claude models | `packages/agents` | ✅ Done, 18 tests plus end-to-end server tests with scripted models (M3a); the test team passes live on `qwen3:8b` (M3b) |
+| Tool gateway: runs every tool after the engine allows it, records results, holds credentials, timeouts, retries, rate limits | `packages/gateway` | ✅ Done, 42 tests (M4, M5) |
+| Reviewer rubric and automated checks (content, email) before review | `packages/gateway`, `packages/agents` | ✅ Done (M5); code checks come with M7 |
 
 Full plan: [`docs/roadmap.md`](docs/roadmap.md) · Design: [`docs/architecture.md`](docs/architecture.md)
 

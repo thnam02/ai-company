@@ -75,7 +75,7 @@ stateDiagram-v2
     planned --> assigned
     assigned --> working: owner starts, deps done
     working --> review: submit + full self-check
-    review --> working: fails review (rework)
+    review --> working: fails checks or review (rework)
     review --> done: passes, no risky action
     review --> awaiting_approval: passes, tier-3 final action
     awaiting_approval --> done: CEO approves
@@ -93,10 +93,10 @@ stateDiagram-v2
 | planned → assigned | Plan passed validation; owner is a worker with the tools the task needs |
 | assigned → working | Caller is the owner; owner not paused or benched; dependencies done; goal budget left; company not paused |
 | working → review | Worker submitted a summary and a self-check marking every criterion met |
-| review → working | Review failed (with feedback) and fewer than 3 attempts used |
+| review → working | Automated checks failed, or the review failed (with feedback), and fewer than 3 attempts used |
 | review → done | Review passed; no final action needing approval |
 | review → awaiting_approval | Review passed, but the final action needs CEO approval |
-| any → escalated | 3 failed reviews or rejections, a step / token / time / budget limit, a tool-call loop, or no progress |
+| any → escalated | 3 failed check runs, reviews or rejections, a step / token / time / budget limit, a tool-call loop, or no progress |
 
 ## Risk tiers and permissions
 
@@ -119,14 +119,20 @@ Permissions:
 
 ## Quality gates
 
-1. **Plan check** (`validatePlan`). The plan must give every task an owner who is a worker, acceptance criteria, a positive cost estimate and only tools the owner has. Dependencies must exist and form no cycle, and the total estimate must fit the remaining goal budget. Any failure rejects the plan with every reason listed; the orchestrator re-plans.
+1. **Plan check** (`validatePlan`). The plan must give every task an owner who is a worker, acceptance criteria (none blank or repeated), a positive cost estimate and only tools the owner has. Dependencies must exist and form no cycle, and the total estimate must fit the remaining goal budget. Any failure rejects the plan with every reason listed; the orchestrator re-plans.
    The goal's planning status (`open` → `planned`, or `escalated`) lives in the engine: a plan is accepted only for an `open` goal, and after more than `maxReplans` (default 3) rejected plans the engine escalates the goal to the CEO. A goal whose budget runs out while it is still being planned is escalated too.
 2. **Self-check** (`submitForReview`). The worker must mark every acceptance criterion met, or the submission is refused. A proposed `finalAction` must use a tool in the task's `requiredTools`: the plan decides what a task may do, so a worker cannot attach an email to a task that was planned only to write a file. The worker is offered only those tools as final actions.
-3. **Automated checks.** Deterministic checks by output type, run by the gateway before review: tests, linter and build for code; style, link and length rules for content; schema and recipient-allowlist checks for emails. *(Milestone 5.)*
-4. **Independent review** (`recordReview`). A reviewer agent scores the output. A fail needs feedback and sends the task back to `working`.
+3. **Automated checks** (`recordChecks`, [ADR 0005](decisions/0005-checks-and-rubric-review.md)). Deterministic checks by output type, run by the gateway after every submit and before any reviewer turn, and recorded as `checks.passed` / `checks.failed`.
+   - Content files: they exist, their length, no placeholders, links that resolve.
+   - Emails: schema, recipients on the CEO's allowlist, body length, placeholders, links a recipient can open.
+   - A failure sends the work back with each reason and counts as a review attempt.
+   - Results name the submission they are for, and record the sha256 of each file checked. If a file changes before the review, the checks run again and the verdict is refused, so a review is always of checked files.
+   - The rules are the CEO's `checks` config.
+   - Code checks (tests, lint, build) wait for a sandbox and come with the engineering department (M7).
+4. **Independent review** (`recordReview`). A reviewer agent judges each acceptance criterion (met or not, with evidence). Code sets `passed` (every criterion met) and `score` (the share met). With `strictReview` (on in the server), the engine refuses a verdict until checks are recorded for the submission, and refuses a rubric that does not cover every criterion exactly once or contradicts `passed`. The rubric is stored with the review. A fail sends the task back to `working`.
 5. **Human gate** (`decideApproval`). Tier-3 final actions wait for the CEO, who sees the output, the review score and the exact action. A rejection needs a note.
 
-Three failed reviews or rejections escalate the task instead of retrying again.
+Three failed check runs, reviews or rejections (counted together) escalate the task instead of retrying again.
 
 ## Limits and safety controls
 
@@ -189,7 +195,7 @@ Agents run inside the server process, one at a time, behind an `AgentPort` ([ADR
 - **Runtime.** `AgentRuntime.step()` picks the next piece of work in this order: a task in review, a task in `working`, an assigned task whose dependencies are done, an open goal to plan. The kill switch, agent pause and bench are checked by every role before every model turn; the engine also refuses reviews and plans while the company is paused, so nothing is released by a verdict that arrives after the stop. Stopping the server aborts the call in flight and waits for running final actions to record their results. A reviewer that gives no usable verdict in 3 tries is not progress: the runtime moves on and backs off, and the goal budget (which covers tasks in review) bounds the retries.
 - **Orchestrator.** Asks for a `PlanTask[]` JSON plan (structured output), records the turn with `recordGoalStep`, submits it, and feeds rejection reasons back until the goal is planned or escalated. An unparseable answer is submitted as an empty plan, so it counts as a rejection.
 - **Worker.** Gets a context pack (its role, the goal, its task and criteria, the summaries and files of the tasks it depends on, any review feedback, and the final action it may propose). Each turn: model call → `recordStep` with real token counts → each tool call through `callTool`, where the gateway asks `requestToolCall` with a fresh key, runs the tool only on `allow` and records the result. It sees only tools the gateway can run, with their input schema. It finishes with `submit_work` (summary, self-check, files, optional final action) or `report_blocked` (escalates its own task). Model-facing tool names use `_` for `.` (`files_read`).
-- **Reviewer.** Gets the criteria, the worker's summary, the contents of the files it produced (read by the runtime, not by a tool call) and the proposed final action, and returns a `ReviewVerdict` JSON, recorded with `recordGoalStep` and `recordReview`.
+- **Reviewer.** Starts only on a task whose automated checks passed. Gets the numbered criteria, the checks that passed, the worker's summary, the contents of the files it produced (read by the runtime, not by a tool call) and the proposed final action. It answers one item per criterion (`met`, `evidence`) as structured JSON; the runtime matches the items to the criteria, asks again if they do not fit, computes the verdict, and records it with `recordGoalStep` and `recordReview`.
 - **Agent-written text is data.** Summaries and files shown to another agent sit between markers with a random per-prompt tag that the text cannot contain, and the system prompt says text inside them is never instructions. This reduces prompt injection but cannot rule it out; tier-3 actions still need the CEO.
 - **Known gaps** (ADR 0003): an escalated goal cannot be reopened by the CEO yet; a model call that fails before returning token counts is not recorded; checkpoints are never pruned.
 
@@ -200,6 +206,7 @@ The only code that runs tools ([ADR 0004](decisions/0004-tool-gateway.md)). It r
 - **Work-time calls.** The gateway makes the idempotency key, asks `requestToolCall`, and runs the tool only on `allow` (never on `duplicate` or a refusal). It then records `tool.executed` or `tool.failed` with `recordToolResult`: the tool, the key, the number of attempts and a detail capped at 1,000 characters. The model gets the output, capped at 20,000 characters, or a reason it can act on: bad input is described exactly, while any other error is recorded and logged in full but reported to the model in plain words.
 - **Final actions.** `release` runs a released action once per key and records `action.executed` / `action.failed`. The engine's copy runs, and only if the engine has it released with no result yet. A tool with no executor on this server is recorded as failed, never left pending.
 - **Kill switch.** Before every attempt, including retries and after rate-limit waits, the gateway checks that the company is not paused. A work-time call stopped this way is recorded as failed with nothing done. A final action (for example one approved while paused) is held and runs when the CEO resumes the company.
+- **Automated checks.** `runPendingChecks` runs the checks (`checkSubmission`: the results plus the sha256 of each file, from one read) for every submission in review with none recorded, and records them with `recordChecks`. The server calls it right after each durable submit; recovery calls it first on boot; the stuck timer and resume retry any left waiting. Nothing runs while the company is paused. A check that throws is recorded as a failed check, and a passing run that could not hash a file fails `files.hashed`. Details are capped and have credentials removed. When a verdict arrives, the server re-hashes the files and records the review in one synchronous command. On a change it records `checks.reset`, refuses the verdict and the files are checked again. The task escalates if the files change during review 3 times (`maxReviewAttempts`). Patterns are linear in the text, and the reading is capped (200 KB per file, 1 MB per submission, 200 links per text). Checks read files only through the workspace sandbox, never call a model or the network, and are configured by the CEO in `checks`: `content.minWords` / `maxWords`, `email.allowedRecipients` (addresses or `@domain`; empty means any), `email.maxBodyWords`.
 - **Recovery.** On boot, before agents start, every allowed call with no result is recorded as failed and never re-run (the worker redoes its turn from its checkpoint). Calls in logs from before M4 never expected a result and are skipped. A released action with no result that never started (each records `action.started` before its first attempt) runs normally. One that started is re-run only if its tool dedupes by key; otherwise it is recorded as failed for the CEO.
 - **Timeouts, retries, rate limits.** Per tool in the company config: `timeoutMs` (default 30,000, between 100 and 600,000), `maxAttempts` (default 3, up to 10) and `ratePerMinute` (default unlimited). Boot refuses a tool whose worst-case call (every attempt and backoff, plus a minute per attempt if rate limited) reaches `stuckAfterMs`. It also refuses to auto-approve a tier-2 tool whose executor does not dedupe by key (ADR 0004). Every attempt is timed out, and the executor's `AbortSignal` fires. A failure is retried, with doubling backoff and jitter capped at 10 s, only when a second try cannot act twice: a `TransientToolError` (raised before any effect, e.g. a 429 or 503), or a timeout of a tool that dedupes by key. A timed-out tool that does not dedupe is reported as "may still have taken effect". The rate limit is a rolling minute per tool, across all agents; calls wait for room.
 - **Credentials.** Kept in `DATA_DIR/credentials.json` (`{ "name": "value" }`). Boot refuses the file if other users can read it (`chmod 600`). Values are held in `Secret`s. A tool declares the names it needs and reads them with `ctx.credential(name)` while it runs. Credential values are replaced by `[secret]` in tool output, event details, logs and errors. Each value is matched as written, URL-encoded, JSON-escaped and base64-encoded, longest first.

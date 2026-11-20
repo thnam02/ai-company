@@ -60,6 +60,7 @@ packages/gateway/     tool gateway (M4): the only code that runs tools
   src/registry.ts     ToolExecutor, ToolRegistry, ToolInputError, TransientToolError
   src/credentials.ts  Secret, CredentialStore (DATA_DIR/credentials.json, chmod 600), redaction
   src/workspace.ts    workspace sandbox (files.read/write, fake email.send)
+  src/checks.ts       gate-3 automated checks (content, email) run before any reviewer (M5)
 
 Planned (see roadmap): `apps/desktop` (Electron, M9).
 
