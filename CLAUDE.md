@@ -43,11 +43,10 @@ apps/server/          server (done): SQLite/Postgres event store, CEO HTTP API, 
   src/run-report.ts   run report (plans, reviews, tokens, time) built from the event log
   config/company.json tools, tiers, limits, agent roster, model options (CEO config)
   config/test-team.json the M3 test team (Ava, Kai, Zara, Rex on ollama:qwen3:8b)
-packages/agents/      agent runtime (M3a): models, tools, role loops — talks to the engine only via AgentPort
+packages/agents/      agent runtime (M3): models, role loops — talks to the company only via AgentPort
   src/model.ts        ModelProvider interface, "<provider>:<model>" refs
   src/providers/      OllamaProvider, ClaudeProvider (official SDK, only with a key), ScriptedProvider (tests)
-  src/port.ts         AgentPort: the allowlisted engine commands agents may call
-  src/tools/          ToolRegistry, workspace sandbox (files.read/write, fake email.send)
+  src/port.ts         AgentPort: the allowlisted commands agents may call (tools only via callTool)
   src/context.ts      prompts and context packs
   src/roles.ts        planner, worker and reviewer loops
   src/runtime.ts      AgentRuntime: one agent at a time, kill switch between turns
@@ -56,7 +55,13 @@ docs/                 architecture.md, roadmap.md, decisions/ (ADRs), runs/ (liv
 .claude/              commands and subagents for working on this repo
 ```
 
-Planned (see roadmap): `packages/gateway` (tool execution, M4), `apps/desktop` (Electron, M9).
+packages/gateway/     tool gateway (M4): the only code that runs tools
+  src/gateway.ts      ToolGateway: requestToolCall → run on allow → record result; final actions; recovery; timeouts, retries, rate limits
+  src/registry.ts     ToolExecutor, ToolRegistry, ToolInputError, TransientToolError
+  src/credentials.ts  Secret, CredentialStore (DATA_DIR/credentials.json, chmod 600), redaction
+  src/workspace.ts    workspace sandbox (files.read/write, fake email.send)
+
+Planned (see roadmap): `apps/desktop` (Electron, M9).
 
 ## Commands
 
@@ -71,7 +76,8 @@ Planned (see roadmap): `packages/gateway` (tool execution, M4), `apps/desktop` (
 - TypeScript, ESM, strict. Only erasable syntax (no `enum`, no `namespace`, no constructor parameter properties) so Node can strip types. Import local files with the `.ts` extension; use `import type` for types.
 - Keep `packages/core` dependency-free and free of I/O and LLM calls.
 - In `apps/server`, everything that leaves the process (responses, stream messages, gateway actions) goes through the command queue `run()`, which waits for the event store's commit first. Build the response inside the function passed to `run()`; never read engine state after the await.
-- Agent code calls engine commands only through `AgentPort` (built on `run()`) and acts on a result (e.g. a tool `allow`) only after it resolves. Never give agent code the engine, the store or the server.
+- Agent code calls engine commands only through `AgentPort` (built on `run()`) and acts on a result only after it resolves. Never give agent code the engine, the store, the server or a tool executor: tools run only in `packages/gateway`, through `callTool` or a released final action.
+- New tools are `ToolExecutor`s in the gateway. Throw `ToolInputError` for bad model input, and `TransientToolError` only for a failure before any effect. Set `dedupesByKey` only if a repeat of the same key cannot act twice. Read credentials with `ctx.credential(name)` after declaring them, and never put them in output.
 - New behaviour starts with a failing test in the matching `test/*.test.ts`. Use `makeCompany()` and `startedTask()` from `test/helpers.ts`.
 - A new event type needs: an emit in a command, a `case` in `apply()`, a test that replays it through `WorkflowEngine.fromEvents`.
 - New tools need a `ToolSpec` with an honest risk tier. When unsure of the tier, pick the higher one.

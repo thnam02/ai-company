@@ -95,14 +95,31 @@ End to end against a real `qwen3:8b`:
 
 Round 2 (manual comparison, not required for M3): the same goal with Ava and Rex on `claude:` models.
 
-## [ ] M4 · Tool gateway (`packages/gateway`)
+## [x] M4 · Tool gateway (`packages/gateway`)
 
-- [ ] Every tool call goes `engine.requestToolCall` → execute only on `allow`, never on `duplicate`
-- [ ] Credentials stored server-side; never in prompts
-- [ ] Executes `execute` actions returned by `recordReview` / `decideApproval`, keyed by idempotency key
-- [ ] Outbox: approved actions are derived from the log and re-released after a crash; a durable execution record (e.g. an `action.executed` event) keeps the gateway from running any key twice. Replaces M2's at-most-once `onExecute` hook
-- [ ] Timeouts, retry with backoff for transient errors, per-tool rate limits
-- [ ] Records tool results and failures as events
+- [x] Every tool call goes `engine.requestToolCall` → execute only on `allow`, never on `duplicate`. The gateway is the only code that runs tools: agents call `AgentPort.callTool` (which replaces `requestToolCall` on the port) and never hold an executor, and the gateway makes every key ([ADR 0004](decisions/0004-tool-gateway.md))
+- [x] Credentials stored server-side; never in prompts:
+  - `DATA_DIR/credentials.json` must be private (`chmod 600`), and each value is held in a `Secret`;
+  - a tool reads only the credentials it declared, while it runs;
+  - values are replaced by `[secret]` in output, events, logs and errors
+- [x] Executes `execute` actions returned by `recordReview` / `decideApproval`, keyed by idempotency key (`gateway.release`, once per key)
+- [x] Outbox: approved actions are derived from the log and re-released after a crash. The durable `action.executed` / `action.failed` record keeps the gateway from running any key twice. M2's `onExecute` hook is removed, and a tool with no executor is recorded as failed
+- [x] Timeouts, retry with backoff for transient errors, per-tool rate limits:
+  - `timeoutMs`, `maxAttempts` and `ratePerMinute` per tool in the company config;
+  - a retry happens only when a second try cannot act twice: a `TransientToolError`, or a timeout of a tool that dedupes by key
+- [x] Records tool results and failures as events: `recordToolResult` emits `tool.executed` / `tool.failed` with the key, the attempts and a capped, credential-free detail. On boot, interrupted calls are recorded as failed and never re-run. The run report counts failed calls
+- [x] Hardened after the architecture review:
+  - the kill switch stops retries and rate-limited waits, and final actions approved while paused are held until resume;
+  - `release` runs only the engine's own copy of a released, unrecorded action;
+  - nothing is released during shutdown;
+  - credentials are redacted in encoded and overlapping forms;
+  - only post-M4 calls expect a result, so an upgraded log is not misreported;
+  - results are credited to the agent that made the call;
+  - agents get a read-only workspace;
+  - boot refuses tool settings whose worst-case call can outlast the stuck timer, and auto-approved tier-2 tools that do not dedupe;
+  - `action.started` is recorded before a final action's first attempt, so an action held by the kill switch through a restart still runs instead of being written off as interrupted
+- [x] 36 new tests: 199 in total with Postgres, 184 without (core 62, agents 14, gateway 30, server 93, or 78 without Postgres). The retry rule, the pause guard and the start record are mutation-checked. The live goal test still passes on `qwen3:8b` (500 s, [run report](runs/2026-11-20-qwen3-8b.md#m4-the-same-goal-through-the-tool-gateway))
+- [ ] Carried forward (ADR 0003, ADR 0004): a worker's turn redone after a crash gets new keys. Checkpoint the pending call and its key before `callTool`, so the redo reuses the key. Until then, boot refuses to auto-approve a tier-2 tool that does not dedupe
 
 ## [ ] M5 · Reviewer and automated checks
 

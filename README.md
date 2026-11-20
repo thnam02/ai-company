@@ -8,11 +8,11 @@ The core rule: **LLMs propose, deterministic code decides.** Agents can't change
 
 | Part | Where | Status |
 | --- | --- | --- |
-| Control plane: workflow engine, policy, limits, event log | `packages/core` | ✅ Done, 54 tests |
+| Control plane: workflow engine, policy, limits, event log | `packages/core` | ✅ Done, 62 tests |
 | 3D office UI | `apps/office` | 🟡 Prototype with simulated agents |
-| Server, SQLite or Postgres, WebSocket | `apps/server` | ✅ Done, 80 tests |
-| Agent runtime: orchestrator, workers, reviewer on Ollama or Claude models | `packages/agents` | ✅ Done, 20 tests plus end-to-end server tests with scripted models (M3a); the test team passes live on `qwen3:8b` (M3b) |
-| Tool gateway | `packages/gateway` | ⬜ Milestone 4 |
+| Server, SQLite or Postgres, WebSocket | `apps/server` | ✅ Done, 93 tests |
+| Agent runtime: orchestrator, workers, reviewer on Ollama or Claude models | `packages/agents` | ✅ Done, 14 tests plus end-to-end server tests with scripted models (M3a); the test team passes live on `qwen3:8b` (M3b) |
+| Tool gateway: runs every tool after the engine allows it, records results, holds credentials, timeouts, retries, rate limits | `packages/gateway` | ✅ Done, 30 tests (M4) |
 
 Full plan: [`docs/roadmap.md`](docs/roadmap.md) · Design: [`docs/architecture.md`](docs/architecture.md)
 
@@ -37,6 +37,8 @@ npm run server       # http://127.0.0.1:4100; call it with "Authorization: Beare
 The agents start with the server. They need [Ollama](https://ollama.com) running with `ollama pull qwen3:8b`; until it is, they wait and retry. Set `AGENTS=off` to run the server without them, and `ANTHROPIC_API_KEY` to let agents use `claude:` models.
 
 Agents work only inside `./workspace` (set `WORKSPACE_DIR` to change it). The fake `email.send` writes emails to `workspace/outbox/` instead of sending them, and only after you approve them.
+
+Agents never run tools themselves: the tool gateway runs every call after the control plane allows it and records the result. Timeouts, retries and rate limits are set per tool in the company config. Tool logins go in `data/credentials.json` (`{ "name": "value" }`, readable only by you: `chmod 600`). They never reach an agent, an event or a log.
 
 To use Postgres instead, set `DATABASE_URL` (e.g. `postgres://localhost/ai_company`). To run the Postgres store tests, and the crash/restart tests against Postgres as well as SQLite, point `DATABASE_URL` at a disposable database (each test uses its own schema and drops it).
 

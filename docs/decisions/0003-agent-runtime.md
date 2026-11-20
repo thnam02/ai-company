@@ -1,6 +1,6 @@
 # ADR 0003 · Agent runtime: in-process, allowlisted, checkpointed
 
-Status: accepted · 2026-11-18
+Status: accepted · 2026-11-18 · tool execution superseded by [ADR 0004](0004-tool-gateway.md): agents call `callTool` instead of `requestToolCall`, and only the gateway runs tools
 
 ## Context
 
